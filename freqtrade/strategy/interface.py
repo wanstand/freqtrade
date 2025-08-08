@@ -11,6 +11,7 @@ from math import isinf, isnan
 from pandas import DataFrame
 from pydantic import ValidationError
 
+from freqtrade.configuration import TimeRange
 from freqtrade.constants import CUSTOM_TAG_MAX_LENGTH, Config, IntOrInf, ListPairsWithTimeframes
 from freqtrade.data.converter import populate_dataframe_with_trades
 from freqtrade.data.converter.converter import reduce_dataframe_footprint
@@ -42,7 +43,6 @@ from freqtrade.strategy.strategy_validation import StrategyResultValidator
 from freqtrade.strategy.strategy_wrapper import strategy_safe_wrapper
 from freqtrade.util import dt_now
 from freqtrade.wallets import Wallets
-
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,9 @@ class IStrategy(ABC, HyperStrategyMixin):
         :return: a Dataframe with all mandatory indicators for the strategies
         """
         return dataframe
+
+    def populate_extra_datas(self, dataframe: DataFrame, metadata: dict) -> list[DataFrame]:
+        return []
 
     def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -1730,7 +1733,7 @@ class IStrategy(ABC, HyperStrategyMixin):
             pair=trade.pair, trade=trade, order=order, current_time=current_time
         )
 
-    def advise_all_indicators(self, data: dict[str, DataFrame]) -> dict[str, DataFrame]:
+    def advise_all_indicators(self, data: dict[str, DataFrame], timerange=None) -> dict[str, DataFrame]:
         """
         Populates indicators for given candle (OHLCV) data (for multiple pairs)
         Does not run advise_entry or advise_exit!

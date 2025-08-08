@@ -464,6 +464,7 @@ class LocalTrade:
     funding_fee_running: float | None = None
     # v 2 -> correct max_stake_amount calculation for leveraged trades
     record_version: int = 2
+    extra_tag: str | None = ""
 
     @property
     def stoploss_or_liquidation(self) -> float:
@@ -756,6 +757,7 @@ class LocalTrade:
             "precision_mode_price": self.precision_mode_price,
             "contract_size": self.contract_size,
             "has_open_orders": self.has_open_orders,
+            "extra_tag": self.extra_tag,
             "orders": orders_json,
         }
 
@@ -986,6 +988,9 @@ class LocalTrade:
 
     def update_order(self, order: CcxtOrder) -> None:
         Order.update_orders(self.orders, order)
+
+    def set_extra_tag(self, tag: str) -> None:
+        self.extra_tag = tag
 
     @property
     def fully_canceled_entry_order_count(self) -> int:
@@ -1602,6 +1607,8 @@ class LocalTrade:
             precision_mode=data.get("precision_mode", None),
             precision_mode_price=data.get("precision_mode_price", data.get("precision_mode", None)),
             contract_size=data.get("contract_size", None),
+            extra_tag=data.get("extra_tag"),
+
         )
         for order in data["orders"]:
             order_obj = Order(
@@ -1731,6 +1738,7 @@ class Trade(ModelBase, LocalTrade):
     funding_fee_running: Mapped[float | None] = mapped_column(Float(), nullable=True, default=None)
 
     record_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    extra_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)  # type: ignore
 
     def __init__(self, **kwargs):
         from_json = kwargs.pop("__FROM_JSON", None)

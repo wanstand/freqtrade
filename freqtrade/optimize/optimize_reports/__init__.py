@@ -10,7 +10,8 @@ from freqtrade.optimize.optimize_reports.bt_output import (
     text_table_strategy,
     text_table_tags,
 )
-from freqtrade.optimize.optimize_reports.bt_storage import store_backtest_results
+from freqtrade.optimize.optimize_reports.bt_storage import store_backtest_results, store_backtest_entire_data,\
+    store_backtest_extra_data, store_backtest_series_data, load_backtest_series_data
 from freqtrade.optimize.optimize_reports.optimize_reports import (
     generate_all_periodic_breakdown_stats,
     generate_backtest_stats,

@@ -56,6 +56,8 @@ from freqtrade.optimize.optimize_reports import (
     generate_trade_signal_candles,
     show_backtest_results,
     store_backtest_results,
+    store_backtest_entire_data,
+    store_backtest_extra_data,
 )
 from freqtrade.persistence import (
     CustomDataWrapper,
@@ -74,7 +76,6 @@ from freqtrade.strategy.strategy_wrapper import strategy_safe_wrapper
 from freqtrade.util import FtPrecise, dt_now
 from freqtrade.util.migrations import migrate_data
 from freqtrade.wallets import Wallets
-
 
 logger = logging.getLogger(__name__)
 
@@ -443,7 +444,7 @@ class Backtesting:
             self.abort = False
             raise DependencyException("Stop requested")
 
-    def _get_ohlcv_as_lists(self, processed: dict[str, DataFrame]) -> dict[str, tuple]:
+    def _get_ohlcv_as_lists(self, processed: dict[str, DataFrame], metas: dict) -> dict[str, tuple]:
         """
         Helper function to convert a processed dataframes into lists for performance reasons.
 
@@ -466,6 +467,15 @@ class Backtesting:
                 # Cleanup from prior runs
                 pair_data.drop(HEADERS[5:] + ["buy", "sell"], axis=1, errors="ignore")
             df_analyzed = self.strategy.ft_advise_signals(pair_data, {"pair": pair})
+
+            extra_datas = self.strategy.populate_extra_datas(df_analyzed, {"pair": pair})
+
+            if metas['strat_name'] is not None and metas['dt_appendix'] is not None:
+                metas['pair'] = pair
+                store_backtest_entire_data(self.config, df_analyzed, metas)
+                for i in range(0, len(extra_datas)):
+                    store_backtest_extra_data(self.config, df_analyzed, i, metas)
+
             # Update dataprovider cache
             self.dataprovider._set_cached_df(
                 pair, self.timeframe, df_analyzed, self.config["candle_type_def"]
@@ -1657,8 +1667,8 @@ class Backtesting:
             self.progress.increment()
 
     def backtest(
-        self, processed: dict, start_date: datetime, end_date: datetime
-    ) -> BacktestContentTypeIcomplete:
+        self, processed: dict, start_date: datetime, end_date: datetime,
+            metas: dict) -> BacktestContentTypeIcomplete:
         """
         Implement backtesting functionality
 
@@ -1672,12 +1682,13 @@ class Backtesting:
         :param end_date: backtesting timerange end datetime
         :return: DataFrame with trades (results of backtesting)
         """
+        logger.warning(f'backtest:{metas["strat_name"]}-{metas["dt_appendix"]}')
         self.prepare_backtest(self.enable_protections)
         # Ensure wallets are up-to-date (important for --strategy-list)
         self.wallets.update()
         # Use dict of lists with data for performance
         # (looping lists is a lot faster than pandas DataFrames)
-        data: dict = self._get_ohlcv_as_lists(processed)
+        data: dict = self._get_ohlcv_as_lists(processed, metas)
 
         # Loop timerange and get candle for each pair at that point in time
         for (
@@ -1704,6 +1715,8 @@ class Backtesting:
         self.wallets.update()
 
         results = trade_list_to_dataframe(LocalTrade.bt_trades)
+        logger.warning(f'backtestend:{metas["strat_name"]}-{metas["dt_appendix"]}')
+
         return {
             "results": results,
             "config": self.strategy.config,
@@ -1718,7 +1731,7 @@ class Backtesting:
         }
 
     def backtest_one_strategy(
-        self, strat: IStrategy, data: dict[str, DataFrame], timerange: TimeRange
+        self, strat: IStrategy, data: dict[str, DataFrame], timerange: TimeRange, dt_appendix: str
     ):
         self.progress.init_step(BacktestState.ANALYZE, 0)
         strategy_name = strat.get_strategy_name()
@@ -1727,7 +1740,7 @@ class Backtesting:
         self._set_strategy(strat)
 
         # need to reprocess data every time to populate signals
-        preprocessed = self.strategy.advise_all_indicators(data)
+        preprocessed = self.strategy.advise_all_indicators(data, timerange)
 
         # Trim startup period from analyzed dataframe
         # This only used to determine if trimming would result in an empty dataframe
@@ -1745,10 +1758,12 @@ class Backtesting:
             f"({(max_date - min_date).days} days)."
         )
         # Execute backtest and store results
+        metas = {'strat_name': strat.get_strategy_name(), 'dt_appendix': dt_appendix}
         results = self.backtest(
             processed=preprocessed,
             start_date=min_date,
             end_date=max_date,
+            metas=metas
         )
         backtest_end_time = dt_now()
         results.update(
@@ -1809,6 +1824,7 @@ class Backtesting:
 
         data, timerange = self.load_bt_data()
         logger.info("Dataload complete. Calculating indicators")
+        dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         self.load_prior_backtest()
 
@@ -1817,7 +1833,7 @@ class Backtesting:
                 # When previous result hash matches - reuse that result and skip backtesting.
                 logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
                 continue
-            min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
+            min_date, max_date = self.backtest_one_strategy(strat, data, timerange, dt_appendix)
 
         # Update old results with new ones.
         if len(self.all_bt_content) > 0:
@@ -1834,7 +1850,6 @@ class Backtesting:
                 self.results["strategy_comparison"].extend(results["strategy_comparison"])
             else:
                 self.results = results
-            dt_appendix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             if self.config.get("export", "none") in ("trades", "signals"):
                 combined_res = combined_dataframes_with_rel_mean(data, min_date, max_date)
                 store_backtest_results(

@@ -91,7 +91,7 @@ def __run_backtest_bg(btconfig: Config):
             logger.info(f"Reusing result of previous backtest for {strategy_name}")
         else:
             min_date, max_date = ApiBG.bt["bt"].backtest_one_strategy(
-                strat, ApiBG.bt["data"], ApiBG.bt["timerange"]
+                strat, ApiBG.bt["data"], ApiBG.bt["timerange"], ""
             )
 
             ApiBG.bt["bt"].results = generate_backtest_stats(

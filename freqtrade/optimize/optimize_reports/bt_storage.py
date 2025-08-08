@@ -1,10 +1,13 @@
 import logging
+from datetime import datetime, time
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from pandas import DataFrame
+import numpy as np
+import pandas as pd
+from pandas import DataFrame, Timestamp
 
 from freqtrade.configuration import sanitize_config
 from freqtrade.constants import LAST_BT_RESULT_FN
@@ -12,7 +15,6 @@ from freqtrade.enums.runmode import RunMode
 from freqtrade.ft_types import BacktestResultType
 from freqtrade.misc import dump_json_to_file, file_dump_json
 from freqtrade.optimize.backtest_caching import get_backtest_metadata_filename
-
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,117 @@ def _generate_filename(recordfilename: Path, appendix: str, suffix: str) -> Path
             recordfilename.parent, f"{recordfilename.stem}-{appendix}"
         ).with_suffix(suffix)
     return filename
+
+
+def store_backtest_extra_data(
+        config: dict,
+        data: pd.DataFrame,
+        index: int,
+        metas: dict
+) -> Path:
+    recordfilename: Path = config["exportfilename"]
+    base_filename = _generate_filename(recordfilename, metas['dt_appendix'], "." + metas['strat_name'])
+    strategy_zip_filename = _generate_filename(recordfilename, metas['dt_appendix'], "." + metas['strat_name'] + "." +
+                                               metas['pair'].replace("/", "-")
+                                               + ".extra." + index + ".zip")
+    # Create zip file and add the files
+    with ZipFile(strategy_zip_filename, "w", ZIP_DEFLATED) as zipf:
+        entire_data_name = f"{base_filename.stem}_extra_data." + index + ".feather"
+        entire_data_buf = BytesIO()
+        data.reset_index().to_feather(
+            entire_data_buf, compression_level=9, compression="lz4"
+        )
+        entire_data_buf.seek(0)
+        zipf.writestr(entire_data_name, entire_data_buf.getvalue())
+    return strategy_zip_filename
+
+
+def _generate_store_filename(fname: Path, func: str, version: str, pair: str, timeframe: str,
+                             start_dt: Timestamp, size: int) -> Path:
+    path = fname
+    pair = pair.replace("/", "-").replace(":", "_")
+    path = path.joinpath("backtest-vars") \
+        .joinpath(start_dt.strftime("%Y-%m-%d_%H-%M-%S") + "_" + timeframe + "_" + str(size))
+    path.mkdir(parents=True, exist_ok=True)
+    path = path.joinpath(pair + "_" + func + "_" + version).with_suffix(".zip")
+    return path
+
+
+def store_backtest_series_data(
+        config: dict,
+        data: pd.Series,
+        func: str,
+        version: str
+) -> Path:
+    pathname = _generate_store_filename(config["user_data_dir"], func, version,
+                                        config['pair'], config['timeframe'], config['date'], config['size'])
+    with ZipFile(pathname, "w", ZIP_DEFLATED) as zipf:
+        entire_data_name = f"{func}_{version}.feather"
+        entire_data_buf = BytesIO()
+        data.copy().rename('value').reset_index().to_feather(
+            entire_data_buf, compression_level=9, compression="lz4"
+        )
+        entire_data_buf.seek(0)
+        zipf.writestr(entire_data_name, entire_data_buf.getvalue())
+    return pathname
+
+
+def load_backtest_series_data(
+        config: dict,
+        func: str,
+        version: str
+) -> np.array:
+    pathname = _generate_store_filename(config["user_data_dir"], func, version,
+                                        config['pair'], config['timeframe'], config['date'], config['size'])
+
+    try:
+        with ZipFile(pathname, "r") as zipf:
+            # 内部文件名是这样生成的：f"{value}_{version}.feather"
+            entire_data_name = f"{func}_{version}.feather"
+
+            # 检查文件是否存在于压缩包中
+            if entire_data_name not in zipf.namelist():
+                raise FileNotFoundError(f"在压缩文件 {pathname} 中未找到文件: {entire_data_name}")
+
+            with zipf.open(entire_data_name, "r") as feather_file:
+                entire_data_buf = BytesIO(feather_file.read())
+
+                # 读取 Feather 文件，它将是一个 DataFrame，因为你存储时调用了 .reset_index()
+                df = pd.read_feather(entire_data_buf)
+
+                # 将 DataFrame 转换回 Series
+                # 由于存储时调用了 reset_index()，原始的 Series 索引会变成 DataFrame 的第一列（通常是 'index'）
+                # 并且 Series 的值会存储在另一个列中，这个列的名字就是 'value' 参数的值。
+                # 所以我们需要将 'index' 列设置为索引，并选择 'value' 列作为 Series。
+
+                # 假设原始索引列名为 'index' (reset_index() 的默认行为)
+                if 'index' not in df.columns or 'value' not in df.columns:
+                    return None
+    except FileNotFoundError:
+        return None
+    return df['value'].values
+
+
+def store_backtest_entire_data(
+        config: dict,
+        data: pd.DataFrame,
+        metas: dict
+) -> Path:
+    recordfilename: Path = config["exportfilename"]
+    base_filename = _generate_filename(recordfilename, metas['dt_appendix'], "." + metas['strat_name'])
+    strategy_zip_filename = _generate_filename(recordfilename, metas['dt_appendix'], "." + metas['strat_name'] + "."
+                                               + metas['pair'].replace("/", "-").replace(":", "_") + ".zip")
+
+    # Create zip file and add the files
+    with ZipFile(strategy_zip_filename, "w", ZIP_DEFLATED) as zipf:
+        entire_data_name = f"{base_filename.stem}_entire_data.feather"
+        entire_data_buf = BytesIO()
+        data.reset_index().to_feather(
+            entire_data_buf, compression_level=9, compression="lz4"
+        )
+        entire_data_buf.seek(0)
+        zipf.writestr(entire_data_name, entire_data_buf.getvalue())
+    return strategy_zip_filename
 
 
 def store_backtest_results(
