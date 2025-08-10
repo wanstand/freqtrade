@@ -327,8 +327,9 @@ class HyperOptimizer:
             # Data is not yet analyzed, rerun populate_indicators.
             processed = self.advise_and_trim(processed)
 
+        metas = {'strat_name': self.backtesting.strategy.get_strategy_name(), 'dt_appendix': ''}
         bt_results = self.backtesting.backtest(
-            processed=processed, start_date=self.min_date, end_date=self.max_date
+            processed=processed, start_date=self.min_date, end_date=self.max_date, metas=metas
         )
         backtest_end_time = datetime.now(UTC)
         bt_results.update(
