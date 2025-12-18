@@ -510,8 +510,10 @@ def generate_strategy_stats(
     trade_stats = generate_trading_stats(results)
 
     periodic_breakdown = {}
+    hyper_params = {}
     if not is_hyperopt:
         periodic_breakdown = {"periodic_breakdown": generate_all_periodic_breakdown_stats(results)}
+        hyper_params = {"hyper_params": content['hyper_params']}
 
     best_pair = (
         max(
@@ -615,6 +617,7 @@ def generate_strategy_stats(
         **periodic_breakdown,
         **daily_stats,
         **trade_stats,
+        **hyper_params,
     }
 
     try:

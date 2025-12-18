@@ -1690,6 +1690,7 @@ class Backtesting:
         # (looping lists is a lot faster than pandas DataFrames)
         data: dict = self._get_ohlcv_as_lists(processed, metas)
 
+        hyper_params = {}
         # Loop timerange and get candle for each pair at that point in time
         for (
             current_time,
@@ -1711,6 +1712,8 @@ class Backtesting:
                         # the trade didn't close or position change is in the same direction
                         break
 
+        for k in processed.keys():
+            hyper_params[k] = self.strategy.fetch_params(k)
         self.handle_left_open(LocalTrade.bt_trades_open_pp, data=data)
         self.wallets.update()
 
@@ -1719,6 +1722,7 @@ class Backtesting:
 
         return {
             "results": results,
+            "hyper_params": hyper_params,
             "config": self.strategy.config,
             "locks": PairLocks.get_all_locks(),
             "rejected_signals": self.rejected_trades,

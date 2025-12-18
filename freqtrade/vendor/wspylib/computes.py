@@ -22,6 +22,7 @@ import math
 
 import numpy as np  # noqa
 import numba as nb
+from numba.typed import List
 import pandas as pd  # noqa
 import talib.abstract as ta
 from scipy.interpolate import CubicSpline
@@ -430,6 +431,207 @@ def _mark_boundary_core(
         direction[idxs:idxe] = direct
         prev_direction[idxs:idxe] = prev_direct
         bound_date[idxs:idxe] = bound_d
+
+
+@nb.jit(nopython=True)
+def _calc_mean(value: np.ndarray, mean: np.ndarray, init_value: np.ndarray, timeperiod: int, to_calc_length: int):
+    n = len(value)
+    start = max(n - to_calc_length, 1)
+    if to_calc_length >= n:
+        mean[0] = init_value
+    for i in range(start, n):
+        if np.isnan(value[i]):
+            mean[i] = mean[i - 1]
+            continue
+        mean[i] = mean[i - 1] + ((value[i] - mean[i - 1]) / timeperiod)
+
+
+"""
+@nb.jit(nopython=True)
+def _mark_hit_band(hh: np.ndarray, ll: np.ndarray, c: np.ndarray, hit: np.ndarray, hitcnt: np.ndarray,
+                   step: int, step_max: int, to_calc_length: int):
+    n = len(hh)
+    start = max(n - to_calc_length, 1)
+    if np.isnan(hit[0]):
+        hit[0] = 0
+    for i in range(start, n):
+        if c[i] > hh[i]:
+            hit[i] = max(hit[i - 1], 0) + step
+            if hit[i] > step_max:
+                hit[i] = step_max
+            hitcnt[i] = max(hitcnt[i - 1], 0) + 1
+        elif c[i] < ll[i]:
+            hit[i] = min(hit[i - 1], 0) - step
+            if hit[i] < (0 - step_max):
+                hit[i] = (0 - step_max)
+            hitcnt[i] = min(hitcnt[i - 1], 0) - 1
+        else:
+            if hit[i - 1] < 0:
+                hit[i] = hit[i - 1] + 1
+                hitcnt[i] = hitcnt[i - 1] - 1
+            elif hit[i - 1] > 0:
+                hit[i] = hit[i - 1] - 1
+                hitcnt[i] = hitcnt[i - 1] + 1
+            else:
+                hitcnt[i] = 0
+                hit[i] = 0
+                
+
+@nb.jit(nopython=True)
+def _mark_hit_line(line: np.ndarray, c: np.ndarray, hit: np.ndarray, step_max: int,
+                   to_calc_length: int):
+    n = len(line)
+    start = max(n - to_calc_length, 1)
+    if np.isnan(hit[0]):
+        hit[0] = 0
+    for i in range(start, n):
+        if c[i] > line[i] and c[i - 1] <= line[i - 1]:
+            hit[i] = step_max
+        elif c[i] < line[i] and c[i - 1] >= line[i - 1]:
+            hit[i] = (0 - step_max)
+        elif hit[i - 1] != 0:
+            hit[i] = hit[i - 1] - np.sign(hit[i - 1])
+        else:
+            hit[i] = 0
+"""
+
+
+@nb.jit(nopython=True)
+def _mark_hit_band(hh: np.ndarray, ll: np.ndarray, c: np.ndarray, hit: np.ndarray, hitcnt: np.ndarray,
+                   step: int, step_max: int, to_calc_length: int):
+    n = len(hh)
+    start = max(n - to_calc_length, 1)
+    m_d = np.exp(-1 / int(step_max / 2))
+    if np.isnan(hit[0]):
+        hit[0] = 0
+    for i in range(start, n):
+        if c[i] > hh[i]:
+            hit[i] = max(hit[i - 1], 0) + step
+            hitcnt[i] = max(hitcnt[i - 1], 0) + 1
+        elif c[i] < ll[i]:
+            hit[i] = min(hit[i - 1], 0) - step
+            hitcnt[i] = min(hitcnt[i - 1], 0) - 1
+        else:
+            if hit[i - 1] < 0:
+                hit[i] = (hit[i - 1] * m_d)
+                if hit[i] > -1:
+                    hit[i] = 0
+                else:
+                    hit[i] = hit[i] + 1
+                hitcnt[i] = hitcnt[i - 1] - 1
+            elif hit[i - 1] > 0:
+                hit[i] = (hit[i - 1] * m_d)
+                if hit[i] < 1:
+                    hit[i] = 0
+                else:
+                    hit[i] = hit[i] - 1
+                hitcnt[i] = hitcnt[i - 1] + 1
+            else:
+                hitcnt[i] = 0
+                hit[i] = 0
+
+
+@nb.jit(nopython=True)
+def _mark_hit_line(line: np.ndarray, c: np.ndarray, hit: np.ndarray, step_max: int,
+                   to_calc_length: int):
+    n = len(line)
+    start = max(n - to_calc_length, 1)
+    m_d = np.exp(-1 / int(step_max / 2))
+    if np.isnan(hit[0]):
+        hit[0] = 0
+    for i in range(start, n):
+        if c[i] > line[i] and c[i - 1] <= line[i - 1]:
+            hit[i] = np.abs(hit[i - 1]) + 1
+        elif c[i] < line[i] and c[i - 1] >= line[i - 1]:
+            hit[i] = -np.abs(hit[i - 1]) - 1
+        elif hit[i - 1] != 0:
+            hit[i] = hit[i - 1] * m_d
+            if np.abs(hit[i]) < 0.05:
+                hit[i] = 0
+        else:
+            hit[i] = 0
+
+
+@nb.jit(nopython=True)
+def _mark_circle_base(side: np.ndarray, idx: np.ndarray, cnt: np.ndarray,
+                      to_calc_length: int):
+    n = len(side)
+    start = max(n - to_calc_length, 1)
+    if np.isnan(side[0]):
+        side[0] = 0
+    if np.isnan(idx[0]) or idx[0] == 0:
+        idx[0] = 10000
+    if np.isnan(cnt[0]) or cnt[0] == 0:
+        cnt[0] = 1
+    for i in range(start, n):
+        if np.isnan(side[i]) or side[i] == 0:
+            side[i] = side[i - 1]
+        if side[i] != side[i - 1]:
+            idx[i] = idx[i - 1] + 1
+            cnt[i] = np.sign(side[i])
+        else:
+            idx[i] = idx[i - 1]
+            cnt[i] = cnt[i - 1] + np.sign(side[i])
+
+
+@nb.jit(nopython=True)
+def _mark_circle_vertexs(cnts: np.ndarray, attrs: [], signs: [], bases: [], avgs: [], maxx: [], max_cnt: [], minn: [],
+                         min_cnt: [],
+                         to_calc_length: int):
+    n = len(cnts)
+    start = max(n - to_calc_length, 1)
+    mark_num = len(attrs)
+    for i in range(start, n):
+        step = 1
+        if cnts[i] < 0:
+            step = -1
+        for j in range(0, mark_num):
+            if cnts[i] == 1 or cnts[i] == -1:
+                bases[j][i] = attrs[j][i]
+                avgs[j][i] = avgs[j][i]
+                maxx[j][i] = attrs[j][i]
+                minn[j][i] = attrs[j][i]
+            else:
+                bases[j][i] = bases[j][i - 1]
+                if cnts[i] != 0:
+                    avgs[j][i] = avgs[j][i - 1] + ((attrs[j][i] - avgs[j][i - 1]) / np.abs(cnts[i]))
+                else:
+                    avgs[j][i] = avgs[j][i - 1] + (attrs[j][i] - avgs[j][i - 1])
+                if cnts[i] > 0 and attrs[j][i] > maxx[j][i - 1]:
+                    max_cnt[j][i] = step
+                    maxx[j][i] = attrs[j][i]
+                elif cnts[i] < 0 and \
+                        ((attrs[j][i] < maxx[j][i - 1] and signs[j] is True) or
+                         (attrs[j][i] > maxx[j][i - 1] and signs[j] is False)):
+                    max_cnt[j][i] = step
+                    maxx[j][i] = attrs[j][i]
+                else:
+                    max_cnt[j][i] = max_cnt[j][i - 1] + step
+                    maxx[j][i] = maxx[j][i - 1]
+                if cnts[i] > 0 and attrs[j][i] < minn[j][i - 1]:
+                    min_cnt[j][i] = step
+                    minn[j][i] = attrs[j][i]
+                elif cnts[i] < 0 and \
+                        ((attrs[j][i] > minn[j][i - 1] and signs[j] is True) or
+                         (attrs[j][i] < minn[j][i - 1] and signs[j] is False)):
+                    min_cnt[j][i] = step
+                    minn[j][i] = attrs[j][i]
+                else:
+                    min_cnt[j][i] = min_cnt[j][i - 1] + step
+                    minn[j][i] = minn[j][i - 1]
+
+
+@nb.jit(nopython=True)
+def _mark_circle_avgs(cnts: np.ndarray, attrs: [], avgs: [], to_calc_length: int):
+    n = len(cnts)
+    start = max(n - to_calc_length, 1)
+    mark_num = len(attrs)
+    for i in range(start, n):
+        for j in range(0, mark_num):
+            if cnts[i] == 1 or cnts[i] == -1:
+                avgs[j][i] = avgs[j][i]
+            else:
+                avgs[j][i] = avgs[j][i - 1] + ((attrs[j][i] - avgs[j][i - 1]) / np.abs(cnts[i]))
 
 
 class OhlcHandler:
@@ -885,6 +1087,38 @@ def mark_flines_numba(config: dict, df: DataFrame, threshold=5.0, col_num=9):
     df[f'dline-{col_num}'] = (df[f'fline-{col_num}'] - df[f'fline-{col_num - 1}'])
 
 
+def calc_rank(config: dict, df: DataFrame, attr: str, window: int, rank_attr: str, to_calc_length: int):
+    ver = f"{attr}_{window}_0001"
+    rank = _auto_load(config, "calc_rank", "rank", ver)
+    fullloaded = (rank is not None)
+    if not fullloaded:
+        n = len(df)
+        m = to_calc_length
+        if to_calc_length >= n:
+            rank = df[attr].rolling(
+                window=window,
+                min_periods=window  # 确保只有在有 N 个完整数据点时才开始计算
+            ).apply(
+                lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
+                raw=False  # 确保 apply 接收 Series 对象
+            )
+            df[rank_attr] = rank
+        else:
+            size = min(to_calc_length + window + 1, n)
+            df.loc[df.index[-m:], rank_attr] = df[attr].iloc[-size].rolling(
+                window=window,
+                min_periods=window  # 确保只有在有 N 个完整数据点时才开始计算
+            ).apply(
+                lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
+                raw=False  # 确保 apply 接收 Series 对象
+            ).iloc[-m]
+            rank = df[rank_attr].value
+        _auto_save(config, rank, "calc_rank", "rank", ver)
+    else:
+        df[rank_attr] = rank
+    return df
+
+
 def mark_boundary_numba(config: dict, df: DataFrame, to_calc_length, threshold=5.0):
     ver = f"threshold_{threshold}_0001"
     bound_date = _auto_load(config, "mark_boundary_numba", "bound_date", ver)
@@ -1122,17 +1356,17 @@ def calc_trend_ratio_ema(config: dict, dataframe: DataFrame, attr: str, dst: np.
         ratio = dataframe[f'tr-{attr}-{wavelenth}-{multi}-{timeperoid}'].values
     calc_trend_ratio(config, attr, data, ratio, wavelenth, multi, to_calc_length)
     dataframe[f'tr-{attr}-{wavelenth}-{multi}-{timeperoid}'] = ratio
-    #print(f'calc_trend_ratio_ema1:dst = ')
-    #print(dst)
+    # print(f'calc_trend_ratio_ema1:dst = ')
+    # print(dst)
     if to_calc_length >= n:
         dst = ta.EMA(ratio, timeperiod=timeperoid)
     else:
-        #print(f'calc_trend_ratio_ema2:ratio = tocal:{to_calc_length}, timeperoid:{timeperoid}')
-        #print(ratio[-to_calc_length - timeperoid:])
+        # print(f'calc_trend_ratio_ema2:ratio = tocal:{to_calc_length}, timeperoid:{timeperoid}')
+        # print(ratio[-to_calc_length - timeperoid:])
         ema = ta.EMA(ratio[-to_calc_length - timeperoid:], timeperiod=timeperoid)
-        #print(ema)
+        # print(ema)
         np.copyto(dst[-to_calc_length:], ema[-to_calc_length:])
-        #print(dst[-to_calc_length:])
+        # print(dst[-to_calc_length:])
     _auto_save(config, dst, "calc_trend_ratio_ema", attr, ver)
     return dst
 
@@ -1165,7 +1399,7 @@ def calc_hurst_rs(config: dict, s: pd.Series, timeperoid=144) -> np.ndarray:
     hurst_rs = np.zeros(len(data))
     for i in range(len(data)):
         if i < timeperoid:
-            hurst_rs[i] = np.NaN
+            hurst_rs[i] = np.nan
         else:
             price_series_arr = np.asarray(data[i - timeperoid:i])
 
@@ -1247,3 +1481,1035 @@ def gaussian(src: np.ndarray, dst: np.ndarray, lookback: int, startAtBar: int, t
         dst[-to_calc_length:] = cdst[-to_calc_length:]
 
     return dst
+
+
+def calc_quantile(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int, quantile: np.float64,
+                  df_attr: str = None) -> np.ndarray:
+    ver = f"window{window}_0004"
+    key = 'q' + str(quantile).replace('.', '_')
+    print(f'quantile:{key}')
+    if quantile == 0.5:
+        key = 'median'
+    # data = _auto_load(wsconfig, f"quantile_{attr}", f'{key}', ver)
+    data = None
+    n = len(df)
+    if data is None:
+        if to_calc_length >= n:
+            if quantile == 0.5:
+                data = df[attr].rolling(window=window).median()
+            else:
+                data = df[attr].rolling(window=window).quantile(quantile)
+        else:
+            m = to_calc_length
+            roll_size = max(n, m + window)
+            if df_attr is None:
+                feature_name = f'_{attr}-quantile-{window}-{key}'
+            else:
+                feature_name = df_attr
+            if quantile == 0.5:
+                df.loc[df.index[-m:], feature_name] = \
+                    df[attr].iloc[-roll_size:].rolling(window=window).median()[-m]
+            else:
+                df.loc[df.index[-m:], feature_name] = \
+                    df[attr].iloc[-roll_size:].rolling(window=window).quantile(quantile)[-m]
+            data = df[feature_name].values
+            print(f'feature_name={feature_name}')
+        _auto_save(wsconfig, data, f"quantile_{attr}", f'{key}', ver)
+    return data
+
+
+def calculate_hma(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperiod: int) -> pd.Series:
+    """
+    计算霍尔移动平均 (Hull Moving Average, HMA)。
+
+    HMA = WMA(2 * WMA(n/2) - WMA(n)), sqrt(n))
+
+    参数:
+        price_series: 输入的价格序列 (例如 'close' 列)。
+        period: HMA 的计算周期 n。
+
+    返回:
+        pandas.Series: 包含 HMA 值的序列。
+    """
+    price_series = df[attr]
+    if timeperiod <= 1:
+        return price_series.copy()
+    half_period = timeperiod // 2
+    sqrt_period = int(math.sqrt(timeperiod))
+    wma1 = ta.WMA(price_series, timeperiod=half_period)
+    wma2 = ta.WMA(price_series, timeperiod=timeperiod)
+    hma_raw = 2 * wma1 - wma2
+    final_smoothing_period = max(1, sqrt_period)
+    hma_final = ta.WMA(hma_raw, timeperiod=final_smoothing_period)
+    return hma_final
+
+
+def calculate_long_mean(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                        attr: str, timeperiod: int, init_value: np.float64, mean_attr: str = None) -> DataFrame:
+    n = len(df)
+    if mean_attr is None:
+        mean_attr = f'{attr}-mean-{timeperiod}'
+    if to_calc_length >= n:
+        mean = np.full(n, np.nan)
+    else:
+        mean = df[mean_attr].values
+    value = df[attr].values
+    _calc_mean(value, mean, init_value, timeperiod, to_calc_length)
+    df[mean_attr] = mean
+    return df
+
+
+def mark_hit_band(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                  attr_h: str, attr_l: str, close: str, step: int = 5, step_max: int = 20,
+                  tgt_attr: str = None, tgt_cnt_attr: str = None):
+    n = len(df)
+    if tgt_attr is None:
+        tgt_attr = f'{attr_h}-bhit'
+    if tgt_cnt_attr is None:
+        tgt_cnt_attr = f'{tgt_attr}-cnt'
+    if to_calc_length >= n:
+        hit = np.full(n, np.nan)
+        hitcnt = np.zeros(n)
+    else:
+        hit = df[tgt_attr].values
+        hitcnt = df[tgt_cnt_attr].values
+    _mark_hit_band(df[attr_h].values, df[attr_l].values, df[close].values, hit, hitcnt, step, step_max, to_calc_length)
+    df[tgt_attr] = hit
+    df[tgt_cnt_attr] = hitcnt
+    return df
+
+
+def mark_hit_line(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                  attr: str, close: str, step_max: int = 30, tgt_attr: str = None):
+    n = len(df)
+    if tgt_attr is None:
+        tgt_attr = f'{attr}-hit'
+    if to_calc_length >= n:
+        hit = np.zeros(n)
+    else:
+        hit = df[tgt_attr].values
+    _mark_hit_line(df[attr].values, df[close].values, hit, step_max, to_calc_length)
+    df[tgt_attr] = hit
+    return df
+
+
+def mark_circle_base(df: DataFrame, wsconfig: dict, to_calc_length: int, side_attr: str,
+                     idx_attr: str = None, cnt_attr: str = None):
+    n = len(df)
+    if idx_attr is None:
+        idx_attr = side_attr.replace('side', 'idx')
+    if cnt_attr is None:
+        cnt_attr = side_attr.replace('side', 'cnt')
+    if to_calc_length >= n:
+        idx = np.zeros(n)
+        cnt = np.zeros(n)
+    else:
+        idx = df[idx_attr].values
+        cnt = df[cnt_attr].values
+    _mark_circle_base(df[side_attr].values, idx, cnt, to_calc_length)
+    df[idx_attr] = idx
+    df[cnt_attr] = cnt
+    return df
+
+
+# chapter系列的生成
+def mark_circle_vertexs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_attr: str, mark_attrs: [],
+                        sides: [], mark_attr_new_names: []):
+    n = len(df)
+    num = len(mark_attrs)
+    _cnt = df[cnt_attr].values
+    _attrs = []
+    _bases = []
+    _avgs = []
+    _maxx = []
+    _minn = []
+    _max_cnts = []
+    _min_cnts = []
+    if to_calc_length >= n:
+        attrs = []
+        for j in range(0, num):
+            attrs.extend([f'{mark_attr_new_names[j]}-base', f'{mark_attr_new_names[j]}-avg',
+                          f'{mark_attr_new_names[j]}-maxx', f'{mark_attr_new_names[j]}-minn',
+                          f'{mark_attr_new_names[j]}-maxxcnt', f'{mark_attr_new_names[j]}-minncnt'])
+        df.loc[:, attrs] = np.nan
+    for j in range(0, num):
+        _attrs.append(df[mark_attrs[j]].values)
+        _bases.append(df[f'{mark_attr_new_names[j]}-base'].values)
+        _avgs.append(df[f'{mark_attr_new_names[j]}-avg'].values)
+        _maxx.append(df[f'{mark_attr_new_names[j]}-maxx'].values)
+        _minn.append(df[f'{mark_attr_new_names[j]}-minn'].values)
+        _max_cnts.append(df[f'{mark_attr_new_names[j]}-maxxcnt'].values)
+        _min_cnts.append(df[f'{mark_attr_new_names[j]}-minncnt'].values)
+    _mark_circle_vertexs(_cnt, _attrs, sides, _bases, _avgs, _maxx, _max_cnts, _minn, _min_cnts, to_calc_length)
+
+
+def mark_circle_avgs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_attr: str, mark_attrs: [],
+                     mark_attr_new_names: []):
+    n = len(df)
+    num = len(mark_attrs)
+    _cnt = df[cnt_attr].values
+    _attrs = []
+    _avgs = []
+    for j in range(0, num):
+        _attrs.append(df[mark_attrs[j]].values)
+        if to_calc_length >= n:
+            _avgs.append(np.zeros(n))
+        else:
+            _avgs.append(df[f'{mark_attr_new_names[j]}-avg'])
+    _mark_circle_avgs(_cnt, _attrs, _avgs, to_calc_length)
+    for j in range(0, num):
+        df[f'{mark_attr_new_names[j]}-avg'] = _avgs[j]
+
+
+##同一化接口
+def calculate_rank(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int,
+                   rank_attr: str = None) -> DataFrame:
+    if rank_attr is None:
+        rank_attr = f'{attr}-rank-{window}'
+    calc_rank(wsconfig, df, attr, window, rank_attr, to_calc_length)
+    return df
+
+
+def calculate_dstr(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                   window, ratio: np.float64 = 0.5,
+                   open_attr: str = 'open', close_attr: str = 'close', volume_attr: str = 'volume'):
+    return numba_cumulative_quantities_ohlc(wsconfig,
+                                            df[open_attr], df[close_attr], df[volume_attr],
+                                            target_ratio=ratio, timeperiod=window,
+                                            to_calc_length=to_calc_length)
+
+
+def calculate_quantile(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int, quantile: np.float64,
+                       quantile_attr: str) -> DataFrame:
+    data = calc_quantile(df, wsconfig, to_calc_length, attr, window, quantile, df_attr=quantile_attr)
+    df[quantile_attr] = data
+    return df
+
+
+def calculate_iqrscore(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int,
+                       iqr_attr: str = None, median_attr: str = None) -> DataFrame:
+    if iqr_attr is None:
+        iqr_attr = f'{attr}-iqrscore-{window}'
+    q3 = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.75)
+    q1 = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.25)
+    media = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.5, df_attr=median_attr)
+    n = len(df)
+    if to_calc_length >= n:
+        df[iqr_attr] = (df[attr] - media) / (q3 - q1)
+    else:
+        m = to_calc_length
+        df.loc[df.index[-m:], iqr_attr] = (df[attr].values[-m] - media[-m]) / (q3[-m] - q1[-m])
+    return df
+
+
+@nb.njit
+def _calculate_qnrscore(_attr: np.ndarray, _qns: np.ndarray, window: int, to_calc_length: int):
+    n = len(_attr)
+    start = max(n - to_calc_length, window - 1)
+    for i in range(start, n):
+        # 定义当前窗口
+        window_data = _attr[i - window + 1: i + 1]
+        current_value = _attr[i]
+        rank_count = 0
+        valid_count = 0
+        for val in window_data:
+            if not np.isnan(val):
+                valid_count += 1
+                if val <= current_value:
+                    rank_count += 1
+        if valid_count > 0:
+            percentile_rank = rank_count / valid_count
+            _qns[i] = percentile_rank - 0.5
+        else:
+            _qns[i] = np.nan
+
+
+@nb.njit
+def pure_numba_searchsorted(arr: List, val):
+    """
+    纯 Numba 实现的二分查找，用于查找 val 的插入位置 (side='left')
+    """
+    low = 0
+    high = len(arr)
+
+    while low < high:
+        mid = (low + high) // 2
+        # 注意：这里直接对 List 进行索引，避免了 np.asarray()
+        if arr[mid] < val:
+            low = mid + 1
+        else:
+            high = mid
+
+    return low  # low 就是 side='left' 的插入索引
+
+
+@nb.njit
+def binary_search_remove(arr: List, val):
+    """
+    在有序 List 中查找并移除第一个匹配的 val。
+    如果找到，返回 True；否则返回 False。
+    """
+    # Numba 不支持 List.remove()，所以我们手动查找并删除
+    n = len(arr)
+
+    # 使用 searchsorted 找到可能的插入点，然后检查周围元素
+    idx = pure_numba_searchsorted(arr, val)
+
+    if idx < n and arr[idx] == val:
+        # 找到匹配，执行删除
+        for j in range(idx, n - 1):
+            arr[j] = arr[j + 1]
+        arr.pop()
+        return True
+    return False
+
+
+@nb.njit
+def binary_search_insert(arr: List, val):
+    """
+    在有序 List 中插入 val 以保持其排序。
+    """
+    n = len(arr)
+    if n == 0:
+        arr.append(val)
+        return
+
+    # 在 List 上使用 np.searchsorted 需要先转换成 np.ndarray
+    idx = pure_numba_searchsorted(arr, val)
+
+    # 手动执行 List 插入操作 (Numba list的插入效率比Python list高)
+    arr.append(arr[n - 1])  # 先扩展List大小
+    for j in range(n - 1, idx, -1):
+        arr[j] = arr[j - 1]
+    arr[idx] = val
+
+
+@nb.njit
+def bit_update(bit_array: np.ndarray, index: int, delta: int):
+    """
+    Fenwick Tree 更新操作。
+    index 必须是 1-based (即 1 到 M)。
+    """
+    i = index
+    # 循环遍历 BIT 树结构，更新相关节点
+    while i < len(bit_array):
+        bit_array[i] += delta
+        i += i & (-i)  # i += LSB(i)
+
+
+@nb.njit
+def bit_query(bit_array: np.ndarray, index: int):
+    """
+    Fenwick Tree 查询操作：查询索引 <= index 的累积频率 (即排名)。
+    index 必须是 1-based。
+    """
+    s = 0
+    i = index
+    # 循环遍历 BIT 树结构，累加相关节点
+    while i > 0:
+        s += bit_array[i]
+        i -= i & (-i)  # i -= LSB(i)
+    return s
+
+
+# 假设 M=10000 是全局常量，并且 _attr 是原始浮点数，_discrete_attr 是预处理的整数
+@nb.njit
+def _calculate_qnrscore_backtest(_attr: np.ndarray, _discrete_attr: np.ndarray,
+                                 _qns: np.ndarray, window: int, to_calc_length: int, M_val: int):
+    n = len(_attr)
+    start = max(window - 1, n - to_calc_length)
+
+    # Fenwick Tree 数组 (1-based 索引，大小为 M_val + 1)
+    # 用于存储窗口内每个离散值的频率
+    bit_array = np.zeros(M_val + 1, dtype=np.int32)
+
+    # 跟踪窗口内有效（非NaN）的总数
+    valid_count = 0
+
+    # 1. 初始化窗口: 索引 0 到 start - 1
+    for i in range(start):
+        d_val = _discrete_attr[i]
+        if not np.isnan(_attr[i]):  # 使用原始浮点数检查NaN
+            bit_update(bit_array, d_val + 1, 1)  # BIT index 1-based
+            valid_count += 1
+
+    # 2. 滚动窗口计算
+    for i in range(start, n):
+        # A. 移除旧值 (i - window 处)
+        if i >= window:
+            old_attr = _attr[i - window]
+            if not np.isnan(old_attr):
+                old_d_val = _discrete_attr[i - window]
+                bit_update(bit_array, old_d_val + 1, -1)  # 移除
+                valid_count -= 1
+
+        # B. 加入新值 (当前值 i 处)
+        current_attr = _attr[i]
+        current_d_val = _discrete_attr[i]
+        is_valid_current = not np.isnan(current_attr)
+
+        if is_valid_current:
+            bit_update(bit_array, current_d_val + 1, 1)  # 加入
+            valid_count += 1
+
+        # C. 计算百分位
+        if valid_count > 0 and is_valid_current:
+            # 查询排名: 小于等于 current_d_val 的所有频率之和
+            rank_count = bit_query(bit_array, current_d_val + 1)
+
+            percentile_rank = rank_count / valid_count
+            _qns[i] = percentile_rank - 0.5
+        else:
+            _qns[i] = np.nan
+
+    return _qns
+
+
+@nb.njit
+def _calculate_qnrscore_fast(_attr: np.ndarray, _qns: np.ndarray, window: int, to_calc_length: int):
+    n = len(_attr)
+    start = max(window - 1, n - to_calc_length)
+
+    # 使用 numba.typed.List 来存储有序的窗口数据，便于高效插入和删除
+    # 注意：Numba List 的实现细节可能导致其插入/删除并非严格 O(window)，
+    # 但相比Python List和纯Numpy数组，它在Numba中通常是最优选择。
+    _sorted_window = List.empty_list(nb.float64)
+
+    # 1. 初始化第一个窗口
+    for i in range(start - window + 1, start):
+        if not np.isnan(_attr[i]):
+            # 初始窗口，使用高效的插入排序
+            binary_search_insert(_sorted_window, _attr[i])
+
+    # 处理 'start' 索引处的最后一个初始数据
+    if not np.isnan(_attr[start - 1]):
+        binary_search_insert(_sorted_window, _attr[start - 1])
+
+    # 2. 滚动窗口计算
+    for i in range(start, n):
+        # A. 移除旧值 (如果存在且有效)
+        # 待移除的值在 i - window 处
+        if i >= window:
+            old_value = _attr[i - window]
+            if not np.isnan(old_value):
+                binary_search_remove(_sorted_window, old_value)
+
+        # B. 加入新值 (当前值)
+        current_value = _attr[i]
+        is_valid_current = not np.isnan(current_value)
+        if is_valid_current:
+            binary_search_insert(_sorted_window, current_value)
+
+        # C. 计算百分位
+        valid_count = len(_sorted_window)
+
+        if valid_count > 0 and is_valid_current:
+            low = 0
+            high = valid_count
+            val_check = current_value + 1e-9  # 保证浮点数比较的安全
+
+            # 查找第一个严格大于 current_value 的索引 (即 side='right')
+            while low < high:
+                mid = (low + high) // 2
+                if _sorted_window[mid] <= current_value:
+                    low = mid + 1
+                else:
+                    high = mid
+
+            rank_count = low  # low 现在是小于等于 current_value 的元素个数
+
+            # 您原代码中的百分位排名定义是： (<= current_value 的数量) / (有效数量)
+            percentile_rank = rank_count / valid_count
+            _qns[i] = percentile_rank - 0.5
+        else:
+            _qns[i] = np.nan
+
+    return _qns
+
+
+def calculate_qnrscore(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                       attr: str, window: int, qnr_attr: str = None) -> pd.DataFrame:
+    if qnr_attr is None:
+        qnr_attr = f'{attr}-qnrscore-{window}'
+    ver = f"0001_timeperoid_{window}"
+    load = None
+    # load = _auto_load(wsconfig, "calculate_qnrscore", attr, ver)
+    if load is not None:
+        df[qnr_attr] = load
+        return df
+    n = len(df)
+    if to_calc_length >= n:
+        df[qnr_attr] = np.full(n, np.nan, dtype=np.float64)
+    _attr = df[attr].values
+    _qns = df[qnr_attr].values
+    if to_calc_length >= n:
+        # 提取非 NaN 的有效数据
+        valid_attr = _attr[~np.isnan(_attr)]
+
+        # 计算全局边界
+        global_min = np.min(valid_attr)
+        global_max = np.max(valid_attr)
+        data_range = global_max - global_min
+        # 归一化（MinMax Scaling）
+        if data_range == 0:
+            # 所有有效值都一样，映射为 0
+            _scaled_attr = np.where(~np.isnan(_attr), 0.0, np.nan)
+        else:
+            _scaled_attr = (_attr - global_min) / data_range
+        M = 10000  # 推荐的精度值
+        _discrete_attr = np.full_like(_attr, -1, dtype=np.int32)  # 使用 -1 或其他值代表 NaN
+        # 仅对非 NaN 的值进行离散化
+        valid_indices = ~np.isnan(_attr)
+        _discrete_attr[valid_indices] = np.floor(_scaled_attr[valid_indices] * M).astype(np.int32)
+        _calculate_qnrscore_backtest(
+            _attr,
+            _discrete_attr,
+            _qns,
+            window,
+            to_calc_length,
+            M_val=M
+        )
+    else:
+        _calculate_qnrscore(_attr, _qns, window, to_calc_length)
+    _auto_save(wsconfig, _qns, "calculate_qnrscore", attr, ver)
+    return df
+
+
+@nb.njit
+def _mark_extreme_memory(attrs: [], vertex_attrs: [],
+                         mems: [], durations: [], vertexes: [], vertex_mems: [],
+                         mems_prev: [], durations_prev: [], vertexes_prev: [], vertex_mems_prev: [],
+                         timeperoid: int, extremes: list[np.float64], to_calc_length):
+    n = len(attrs[0])
+    num = len(attrs)
+    n_start = max(n - to_calc_length, 0)
+    m_cut = np.exp((-3))
+    m_0 = np.exp(-1 / timeperoid)
+    for j in range(0, num):
+        attr = attrs[j]
+        mem = mems[j]
+        mem_prev = mems_prev[j]
+        extreme = extremes[j]
+        vertex_attr = vertex_attrs[j]
+        if durations is not None:
+            duration = durations[j]
+            duration_prev = durations_prev[j]
+        else:
+            duration = None
+            duration_prev = None
+        if vertexes is not None:
+            vertex = vertexes[j]
+            vertex_mem = vertex_mems[j]
+            vertex_prev = vertexes_prev[j]
+            vertex_mem_prev = vertex_mems_prev[j]
+        else:
+            vertex = None
+            vertex_mem = None
+            vertex_prev = None
+            vertex_mem_prev = None
+        for i in range(n_start, n):
+            if i == 0:
+                mem[i] = 0
+                mem_prev[i] = 0
+                if duration is not None:
+                    duration[i] = 0
+                    duration_prev[i] = 0
+                if vertex is not None:
+                    vertex[i] = 0
+                    vertex_mem[i] = 0
+                    vertex_prev[i] = 0
+                    vertex_mem_prev[i] = 0
+            switch = False
+            if np.abs(attr[i]) > extreme:
+                _sign = np.sign(attr[i])
+                if np.abs(mem[i-1]) < 0.9 or np.sign(mem[i-1]) != _sign:
+                    switch = True
+                mem[i] = _sign
+                if duration is not None:
+                    if np.sign(duration[i - 1]) != _sign:
+                        duration[i] = _sign
+                    else:
+                        duration[i] = duration[i - 1] + _sign
+                if vertex is not None:
+                    if np.sign(vertex[i - 1]) != _sign:
+                        vertex[i] = vertex_attr[i]
+                        vertex_mem[i] = vertex_attr[i]
+                    elif np.abs(attr[i]) > np.abs(vertex[i - 1]):
+                        vertex[i] = vertex_attr[i]
+                        vertex_mem[i] = vertex_attr[i]
+                    elif np.abs(attr[i]) > np.abs(vertex_mem[i - 1]):
+                        vertex[i] = vertex[i - 1]
+                        vertex_mem[i] = attr[i]
+                    else:
+                        vertex[i] = vertex[i - 1]
+                        vertex_mem[i] = vertex_mem[i - 1] * m_0
+            elif mem[i - 1] != 0:
+                mem[i] = mem[i - 1] * m_0
+                if duration is not None:
+                    duration[i] = duration[i - 1]
+                if vertex is not None:
+                    vertex[i] = vertex[i - 1]
+                    vertex_mem[i] = vertex_mem[i - 1] * m_0
+                    if np.abs(vertex_mem[i]) < np.abs(vertex[i]) * m_cut:
+                        vertex[i] = 0
+                        vertex_mem[i] = 0
+                if np.abs(mem[i]) < m_cut:
+                    mem[i] = 0
+            if switch:
+                mem_prev[i] = mem[i - 1] * m_0
+                if duration is not None:
+                    duration_prev[i] = duration[i - 1]
+                if vertex is not None:
+                    vertex_prev[i] = vertex[i - 1]
+                    vertex_mem_prev[i] = vertex_mem[i - 1] * m_0
+                    if np.abs(vertex_mem_prev[i]) < np.abs(vertex_prev[i]) * m_cut:
+                        vertex_prev[i] = 0
+                        vertex_mem_prev[i] = 0
+                if np.abs(mem_prev[i]) < m_cut:
+                    mem_prev[i] = 0
+            elif mem_prev[i - 1] != 0:
+                mem_prev[i] = mem_prev[i - 1] * m_0
+                if duration_prev is not None:
+                    duration_prev[i] = duration_prev[i - 1]
+                if vertex_prev is not None:
+                    vertex_prev[i] = vertex_prev[i - 1]
+                    vertex_mem_prev[i] = vertex_mem_prev[i - 1] * m_0
+                    if np.abs(vertex_mem_prev[i]) < np.abs(vertex_prev[i]) * m_cut:
+                        vertex_prev[i] = 0
+                        vertex_mem_prev[i] = 0
+                if np.abs(mem_prev[i]) < m_cut:
+                    mem_prev[i] = 0
+
+
+def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                        attrs: list[str], vertex_attrs: list[str], n_attrs: list[str], timeperoid: int,
+                        extremes: list[np.float64],
+                        with_dure=True, with_vertex=True) -> DataFrame:
+    num = len(attrs)
+    if num == 0:
+        return df
+    _attrs = [None] * num
+    _mems = [None] * num
+    _mems_prev = [None] * num
+    _vertex_attrs = [None] * num
+    if with_dure is True:
+        _durations = [None] * num
+        _durations_prev = [None] * num
+    else:
+        _durations = None
+        _durations_prev = None
+    if with_vertex is True:
+        _vertexes = [None] * num
+        _vertex_mems = [None] * num
+        _vertexes_prev = [None] * num
+        _vertex_mems_prev = [None] * num
+    else:
+        _vertexes = None
+        _vertex_mems = None
+        _vertexes_prev = None
+        _vertex_mems_prev = None
+    for i in range(0, len(attrs)):
+        _attrs[i] = df[attrs[i]].values
+        _vertex_attrs[i] = df[vertex_attrs[i]].values
+    n = len(df)
+    if to_calc_length >= n:
+        # extreme 的mem，duration原值， duration的mem，极值原始值，极值的mem乘以原始值
+        multi = 4
+        if with_dure is False:
+            multi = multi - 1
+        if with_vertex is False:
+            multi = multi - 2
+        array = np.full((n, len(attrs) * multi * 2), 0.0)
+        for i in range(0, len(n_attrs)):
+            df[f'{n_attrs[i]}-mem'] = array[:, i * multi * 2]
+            df[f'{n_attrs[i]}-mem-prev'] = array[:, i * multi * 2 + 1]
+            if with_dure is True:
+                df[f'{n_attrs[i]}-duration'] = array[:, i * multi * 2 + 2]
+                df[f'{n_attrs[i]}-duration-prev'] = array[:, i * multi * 2 + 3]
+            if with_vertex is True:
+                df[f'{n_attrs[i]}-vertex'] = array[:, (i+1) * multi * 2 - 4]
+                df[f'{n_attrs[i]}-vertexmem'] = array[:, (i+1) * multi * 2 - 3]
+                df[f'{n_attrs[i]}-vertex-prev'] = array[:, (i+1) * multi * 2 - 2]
+                df[f'{n_attrs[i]}-vertexmem-prev'] = array[:, (i+1) * multi * 2 - 1]
+    for i in range(0, len(attrs)):
+        _mems[i] = df[f'{n_attrs[i]}-mem'].values
+        _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
+        if with_dure is True:
+            _durations[i] = df[f'{n_attrs[i]}-duration'].values
+            _durations_prev[i] = df[f'{n_attrs[i]}-duration-prev'].values
+        if with_vertex is True:
+            _vertexes[i] = df[f'{n_attrs[i]}-vertex'].values
+            _vertex_mems[i] = df[f'{n_attrs[i]}-vertexmem'].values
+            _vertexes_prev[i] = df[f'{n_attrs[i]}-vertex-prev'].values
+            _vertex_mems_prev[i] = df[f'{n_attrs[i]}-vertexmem-prev'].values
+    _mark_extreme_memory(_attrs, _vertex_attrs,
+                         _mems, _durations, _vertexes, _vertex_mems,
+                         _mems_prev, _durations_prev, _vertexes_prev, _vertex_mems_prev,
+                         timeperoid, extremes, to_calc_length)
+    return df
+
+
+def mark_neutral_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                        attrs: list[str], n_attrs: list[str], timeperoid: int, params: list[np.float64]) -> DataFrame:
+    num = len(attrs)
+    if num == 0:
+        return df
+    _attrs = [None] * num
+    _mems = [None] * num
+    _durations = [None] * num
+    _mems_prev = [None] * num
+    _durations_prev = [None] * num
+    for i in range(0, len(attrs)):
+        _attrs[i] = df[attrs[i]].values
+    n = len(df)
+    if to_calc_length >= n:
+        array = np.full((n, len(attrs) * 4), 0.0)
+        for i in range(0, len(n_attrs)):
+            df[f'{n_attrs[i]}-mem'] = array[:, i * 4]
+            df[f'{n_attrs[i]}-duration'] = array[:, i * 4 + 1]
+            df[f'{n_attrs[i]}-mem-prev'] = array[:, i * 4]
+            df[f'{n_attrs[i]}-duration-prev'] = array[:, i * 4 + 1]
+    for i in range(0, len(attrs)):
+        _mems[i] = df[f'{n_attrs[i]}-mem'].values
+        _durations[i] = df[f'{n_attrs[i]}-duration'].values
+        _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
+        _durations_prev[i] = df[f'{n_attrs[i]}-duration-prev'].values
+    _mark_neutral_memory(_attrs, _mems, _durations, _mems_prev, _durations_prev, timeperoid, params, to_calc_length)
+    return df
+
+
+@nb.njit
+def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], durations_prev: [], timeperoid: int, params: list[np.float64],
+                         to_calc_length: int):
+    n = len(attrs[0])
+    num = len(attrs)
+    n_start = max(n - to_calc_length, 0)
+    m_cut = np.exp((-3))
+    m_0 = np.exp(-1 / timeperoid)
+    for j in range(0, num):
+        attr = attrs[j]
+        mem = mems[j]
+        mem_prev = mems_prev[j]
+        duration = durations[j]
+        duration_prev = durations_prev[j]
+        param = params[j]
+        for i in range(n_start, n):
+            if i == 0:
+                mem[i] = 0
+                duration[i] = 0
+                mem_prev[i] = 0
+                duration_prev[i] = 0
+            switch = False
+            if np.abs(attr[i]) < param:
+                _sign = np.sign(attr[i])
+                if np.abs(mem[i-1]) < 0.9 or np.sign(mem[i-1]) != _sign:
+                    switch = True
+                mem[i] = _sign
+                if switch:
+                    duration[i] = _sign
+                else:
+                    duration[i] = duration[i - 1] + _sign
+            elif mem[i - 1] != 0:
+                mem[i] = mem[i - 1] * m_0
+                duration[i] = duration[i - 1]
+                if np.abs(mem[i]) < m_cut:
+                    mem[i] = 0
+            if switch:
+                mem_prev[i] = mem[i - 1] * m_0
+                duration_prev[i] = duration[i - 1]
+                if np.abs(mem_prev[i]) < m_cut:
+                    mem_prev[i] = 0
+            elif mem_prev[i-1] != 0:
+                mem_prev[i] = mem_prev[i - 1] * m_0
+                duration_prev[i] = duration_prev[i - 1]
+                if np.abs(mem_prev[i]) < m_cut:
+                    mem_prev[i] = 0
+
+
+
+
+def mark_extreme_integral(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                          attrs: list[str], n_attrs: list[str], timeperoid: int, params: list[np.float64]) -> DataFrame:
+    num = len(attrs)
+    if num == 0:
+        return df
+    _attrs = [None] * num
+    _integs = [None] * num
+    _amounts = [None] * num
+    for i in range(0, len(attrs)):
+        _attrs[i] = df[attrs[i]].values
+    n = len(df)
+    if to_calc_length >= n:
+        array = np.full((n, len(attrs) * 2), 0.0)
+        for i in range(0, len(n_attrs)):
+            df[f'{n_attrs[i]}-integral'] = array[:, i * 2]
+            df[f'{n_attrs[i]}-amount'] = array[:, i * 2 + 1]
+    for i in range(0, len(attrs)):
+        _integs[i] = df[f'{n_attrs[i]}-integral'].values
+        _amounts[i] = df[f'{n_attrs[i]}-amount'].values
+    _mark_extreme_integral(_attrs, _integs, _amounts, timeperoid, params, to_calc_length)
+    return df
+
+
+@nb.njit
+def _mark_extreme_integral(attrs: [], integs: [], amounts: [], timeperoid: int, params: list[np.float64],
+                           to_calc_length: int):
+    n = len(attrs[0])
+    num = len(attrs)
+    n_start = max(n - to_calc_length, 0)
+    for j in range(0, num):
+        attr = attrs[j]
+        integ = integs[j]
+        amount = amounts[j]
+        param = params[j]
+        for i in range(n_start, n):
+            if i == 0:
+                last_integ = 0
+                last_amount = 0
+            else:
+                last_integ = integ[i - 1]
+                last_amount = amount[i - 1]
+            dif = np.abs(attr[i]) - param
+            if dif > 0:
+                _sign = np.sign(attr[i])
+                integ[i] = _sign * dif + last_integ
+                amount[i] = _sign + last_amount
+            else:
+                integ[i] = last_integ
+                amount[i] = 0
+            if i > timeperoid:
+                difx = np.abs(attr[i - timeperoid]) - param
+                if difx > 0:
+                    _signx = 0 - np.sign(attr[i])
+                    integ[i] = _signx * difx + integ[i]
+
+
+@nb.njit
+def _calculate_ratr(_attr, _n_attr, timeperiod, to_calc_length):
+    n = len(_attr)
+    first_valid_idx = 0
+    for k in range(n):
+        if not np.isnan(_attr[k]):
+            first_valid_idx = k
+            break
+    if first_valid_idx >= n - 1:
+        return
+    start = max(n - to_calc_length, first_valid_idx + timeperiod + 1)
+    if n - to_calc_length < first_valid_idx + timeperiod + 1:
+        _sum = 0
+        for i in range(first_valid_idx + 1, first_valid_idx + timeperiod + 1):
+            _sum = _sum + np.abs(_attr[i] - _attr[i - 1])
+        _n_attr[first_valid_idx + timeperiod] = _sum / timeperiod
+    for i in range(start, n):
+        tr = np.abs(_attr[i] - _attr[i - 1])
+        _n_attr[i] = _n_attr[i - 1] + (tr - _n_attr[i - 1]) / timeperiod
+
+
+def calculate_ratr(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                   attr: str, n_attr: str, timeperiod: int) -> DataFrame:
+    n = len(df)
+    if to_calc_length >= n:
+        df[f'{n_attr}'] = np.zeros(n)
+    _attr = df[attr].values
+    _n_attr = df[f'{n_attr}'].values
+    _calculate_ratr(_attr, _n_attr, timeperiod, to_calc_length)
+    return df
+
+
+def calculate_hurst(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperoid: int) -> pd.Series:
+    """
+        主要滚动计算函数，将数据准备好后，交由 Numba 优化函数处理。
+    """
+    ver = f"0002_timeperoid_{timeperoid}_optimized"
+    load = _auto_load(wsconfig, "calc_hurst_rs_optimized", attr, ver)
+    if load is not None:
+        return load
+
+    s = df[attr]
+    # 1. 预先计算整个序列的对数收益率 (Log Returns)
+    # 避免在循环中重复计算 np.log 和 np.diff
+    log_prices = np.log(s.values)
+    log_returns_full = np.diff(log_prices)
+
+    # 2. 调用 Numba 优化函数进行滚动计算
+    # 将整个 log_returns 数组和滚动窗口大小传递给 Numba
+    # Numba 函数将在 C 速度下处理滚动循环
+    hurst_rs_array = _calculate_rolling_hurst_numba(log_returns_full, timeperoid)
+    final_result = np.full(len(s), np.nan)
+
+    target_slice = final_result[timeperoid:]
+    print(f'target={len(target_slice)}, hurst={len(hurst_rs_array)}')
+    if len(target_slice) != len(hurst_rs_array):
+        # 临时调试：如果遇到这个错误，请返回这里，检查 L_log, L, timeperoid 之间的关系
+        # 例如：print(f"Target len: {len(target_slice)}, Source len: {len(source_array)}")
+        # 假设我们在 log_returns 的最后一个点结束计算，则结果应该比 log_returns 短 timeperoid - 1。
+
+        # 简单粗暴但有效的方法：直接用 Numba 结果的长度来确定切片
+        target_slice_start = len(s) - len(hurst_rs_array)
+        final_result[target_slice_start:] = hurst_rs_array
+    else:
+        # 如果长度匹配，使用原始逻辑 (但这次应该不会再错)
+        final_result[timeperoid:] = hurst_rs_array
+
+    _auto_save(wsconfig, final_result, "calc_hurst_rs_optimized", s.name, ver)
+    return final_result
+
+
+@nb.jit(nopython=True)
+def _calculate_rs_values_for_window(log_returns_segment):
+    """
+    原始 R/S 核心计算逻辑，现在只处理单个窗口。
+    """
+    n_values = []
+    rs_values = []
+
+    # 简化：使用 50 个子段，减少计算量，同时保持准确性
+    max_k = len(log_returns_segment) // 2
+    # 设定最小 segment size，如 20
+    segment_min = 20
+
+    # 循环选择的子段长度 k
+    for k in range(segment_min, max_k + 1):
+        num_segments = len(log_returns_segment) // k
+
+        # 确保有足够的段数，例如至少 3 段
+        if num_segments < 3:
+            continue
+
+        rs_per_segment_sum = 0.0
+        rs_per_segment_count = 0
+
+        for i in range(num_segments):
+            start_idx = i * k
+            end_idx = start_idx + k
+            segment = log_returns_segment[start_idx:end_idx]
+
+            mean_segment = np.mean(segment)
+            cumulative_deviation = np.cumsum(segment - mean_segment)
+
+            R = np.max(cumulative_deviation) - np.min(cumulative_deviation)
+            S = np.std(segment)
+
+            if S > 1e-9:  # 使用一个小值而不是 0
+                rs_per_segment_sum += R / S
+                rs_per_segment_count += 1
+
+        if rs_per_segment_count > 0:
+            avg_rs = rs_per_segment_sum / rs_per_segment_count
+            n_values.append(k)
+            rs_values.append(avg_rs)
+
+    # 返回 NumPy 数组
+    return np.array(n_values), np.array(rs_values)
+
+
+@nb.njit
+def _calculate_rolling_hurst_numba(log_returns_full, window_size):
+    """
+    在 Numba 内部执行高效的滚动计算和 polyfit。
+    """
+    full_length = len(log_returns_full)
+    # 结果数组的长度
+    result_length = full_length - window_size
+    hurst_rs = np.zeros(result_length)
+
+    # Python 外部的 polyfit 必须在这里实现
+    # 由于 np.polyfit 不支持 nopython=True，我们需要手动实现线性回归
+
+    for i in range(result_length):
+        if i % 1000 == 0:
+            print(f'hurst: {i}/{result_length}')
+        segment = log_returns_full[i:i + window_size]
+
+        # 调用核心 R/S 计算
+        n_values, rs_values = _calculate_rs_values_for_window(segment)
+
+        # 在 Numba 中手动实现线性回归 (代替 np.polyfit)
+        if len(n_values) >= 5:
+            log_n = np.log(n_values)
+            log_rs = np.log(rs_values)
+
+            # 手动计算线性回归 (最小二乘法)
+            n = len(log_n)
+            sum_x = np.sum(log_n)
+            sum_y = np.sum(log_rs)
+            sum_xy = np.sum(log_n * log_rs)
+            sum_xx = np.sum(log_n * log_n)
+
+            # 斜率 (Slope) 公式
+            numerator = n * sum_xy - sum_x * sum_y
+            denominator = n * sum_xx - sum_x * sum_x
+
+            if denominator != 0:
+                hurst_exponent = numerator / denominator
+                if hurst_exponent < 0.0:
+                    hurst_rs[i] = 0.0
+                elif hurst_exponent > 1.0:
+                    hurst_rs[i] = 1.0
+                else:
+                    hurst_rs[i] = hurst_exponent
+            else:
+                hurst_rs[i] = np.nan
+        else:
+            hurst_rs[i] = np.nan
+
+    return hurst_rs
+
+
+@nb.njit
+def _mark_next_ups(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax: int):
+    n = len(values)
+    for i in range(0, n):
+        _end = min(n, i+timemax)
+        _v = values[i] + gaps[i]
+        for j in range(i, _end):
+            if values[j] >= _v:
+                rs[i] = j-i
+                break
+
+
+@nb.njit
+def _mark_next_downs(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax: int):
+    n = len(values)
+    for i in range(0, n):
+        _end = min(n, i+timemax)
+        _v = values[i] - gaps[i]
+        for j in range(i, _end):
+            if values[j] <= _v:
+                rs[i] = j-i
+                break
+
+
+def mark_next_ups(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax: int, param: np.float64,
+                  attr: str = None) -> np.ndarray:
+    _display_attr = 'None' if attr is None else attr
+    ver = f"0003_timemax_{timemax}_param_{param}_optimized"
+    #load = _auto_load(wsconfig, "mark_next_ups", _display_attr, ver)
+    #if load is not None:
+    #    return load
+    if attr is None:
+        gaps = np.full(len(df), param, dtype=np.float64)
+    else:
+        gaps = df[attr].values * param
+    ups = np.full(len(df), timemax, dtype=np.float64)
+    _mark_next_ups(df['close'].values, gaps, ups, timemax)
+    #_auto_save(wsconfig, ups, "mark_next_ups", _display_attr, ver)
+    return ups
+
+
+def mark_next_downs(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax: int, param: np.float64,
+                  attr: str = None) -> np.ndarray:
+    _display_attr = 'None' if attr is None else attr
+    ver = f"0003_timemax_{timemax}_param_{param}_optimized"
+    #load = _auto_load(wsconfig, "mark_next_downs", _display_attr, ver)
+    #if load is not None:
+    #    return load
+    if attr is None:
+        gaps = np.full(len(df), param, dtype=np.float64)
+    else:
+        gaps = df[attr].values * param
+    dps = np.full(len(df), timemax, dtype=np.float64)
+    _mark_next_downs(df['close'].values, gaps, dps, timemax)
+    #_auto_save(wsconfig, ups, "mark_next_downs", _display_attr, ver)
+    return dps
+

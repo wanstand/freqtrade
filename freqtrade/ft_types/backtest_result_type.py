@@ -43,6 +43,7 @@ class BacktestHistoryEntryType(BacktestMetadataType):
 
 class BacktestContentTypeIcomplete(TypedDict, total=False):
     results: DataFrame
+    hyper_params: dict
     config: Config
     locks: Any
     rejected_signals: int
