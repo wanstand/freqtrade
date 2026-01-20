@@ -9,8 +9,10 @@ from freqtrade.vendor.wspylib.computes import (
     rationalQuadratic,
     calc_rank, calculate_hma, calculate_long_mean, calculate_rank, calculate_dstr,
     mark_hit_band, mark_hit_line, mark_circle_base, calculate_iqrscore, calculate_quantile, mark_circle_vertexs,
+    mark_circle_vertexs2,
     mark_circle_avgs, calculate_hurst, mark_extreme_memory, calculate_ratr, calculate_qnrscore, mark_neutral_memory,
     mark_extreme_integral, mark_next_ups, mark_next_downs,
+    calculate_circle_length_ema
 )
 from freqtrade.vendor.wspylib.statistics import (
     statistic_prints,

@@ -591,6 +591,8 @@ def _mark_circle_vertexs(cnts: np.ndarray, attrs: [], signs: [], bases: [], avgs
                 avgs[j][i] = avgs[j][i]
                 maxx[j][i] = attrs[j][i]
                 minn[j][i] = attrs[j][i]
+                min_cnt[j][i] = 0
+                max_cnt[j][i] = 0
             else:
                 bases[j][i] = bases[j][i - 1]
                 if cnts[i] != 0:
@@ -632,6 +634,163 @@ def _mark_circle_avgs(cnts: np.ndarray, attrs: [], avgs: [], to_calc_length: int
                 avgs[j][i] = avgs[j][i]
             else:
                 avgs[j][i] = avgs[j][i - 1] + ((attrs[j][i] - avgs[j][i - 1]) / np.abs(cnts[i]))
+
+
+@nb.jit(nopython=True)
+def _mark_circle_vertexs2(cnt: np.ndarray, attrs: [], signs: np.ndarray, _bases: [],
+                          _maxxs: [], _minns: [],
+                          # _maxx_ratios: [], _minn_ratios: [],
+                          _max_cnts: [], _min_cnts: [], _max_cnt_ratios: [], _min_cnt_ratios: [],
+                          _cnts: np.ndarray, steps: list[int], L: int, to_calc_length: int):
+    n = len(cnt)
+    start = max(n - to_calc_length, 1)
+    mark_num = len(attrs)
+    step_num = len(steps)
+    circle_num = 0
+    for s in steps:
+        if s > circle_num:
+            circle_num = s
+    safe_circle_num = max(circle_num, 1)
+    buf_total_len = safe_circle_num * 2
+    # 使用 prange 对不同特征并行处理
+    for j in nb.prange(mark_num):
+        sign_val = signs[j]
+        attr_vec = attrs[j]
+
+        # buffer 形状: [circle_num, 2] -> 0 为 U, 1 为 D
+        buf_bases = np.full(buf_total_len, np.nan)
+        buf_cnts = np.full(buf_total_len, np.nan)
+        buf_maxx = np.full(buf_total_len, np.nan)
+        buf_minn = np.full(buf_total_len, np.nan)
+        buf_max_cnts = np.full(buf_total_len, np.nan)
+        buf_min_cnts = np.full(buf_total_len, np.nan)
+        ptr_u_buf = buf_total_len - 2
+        ptr_d_buf = buf_total_len - 1
+
+        # 填充历史周期数据
+        found_u = 0
+        found_d = 0
+        for p in range(start - 2, 0, -1):
+            if found_u >= safe_circle_num and found_d >= safe_circle_num:
+                break
+            if cnt[p + 1] == 1 and found_u < safe_circle_num:
+                write_idx = (safe_circle_num - 1 - found_u) * 2
+                idx0_u = (j * step_num * 2)
+                buf_bases[write_idx] = _bases[idx0_u][p]
+                buf_cnts[write_idx] = _cnts[idx0_u][p]
+                buf_maxx[write_idx] = _maxxs[idx0_u][p]
+                buf_minn[write_idx] = _minns[idx0_u][p]
+                buf_max_cnts[write_idx] = _max_cnts[idx0_u][p]
+                buf_min_cnts[write_idx] = _min_cnts[idx0_u][p]
+                found_u += 1
+            elif cnt[p + 1] == -1 and found_d < safe_circle_num:
+                write_idx = (safe_circle_num - 1 - found_d) * 2 + 1
+                idx0_d = (j * step_num * 2) + 1
+                buf_bases[write_idx] = _bases[idx0_d][p]
+                buf_cnts[write_idx] = _cnts[idx0_d][p]
+                buf_maxx[write_idx] = _maxxs[idx0_d][p]
+                buf_minn[write_idx] = _minns[idx0_d][p]
+                buf_max_cnts[write_idx] = _max_cnts[idx0_d][p]
+                buf_min_cnts[write_idx] = _min_cnts[idx0_d][p]
+                found_d += 1
+
+        for i in range(start, n):
+            val = attr_vec[i]
+            if np.isnan(val):
+                continue
+            # 使用简单的映射建立 mode (位值)
+            # 1: U结算, 2: D结算, 0: 全增量
+            mode = 0
+            if cnt[i] == 1:
+                mode = 1
+            elif cnt[i] == -1:
+                mode = 2
+
+            for side in range(2):  # 0: U, 1: D
+                # 通过位移和与运算判断当前 side 是否需要结算
+                # 如果 (mode >> 0) & 1 为真，处理 U 结算
+                # 如果 (mode >> 1) & 1 为真，处理 D 结算
+                is_settle = (mode >> side) & 1
+                is_rev = (side == 1 and sign_val)
+
+                if is_settle:
+                    # --- 路径 A: 结算逻辑 ---
+                    if side == 0:
+                        ptr_u_buf = (ptr_u_buf + 2) % buf_total_len
+                        curr_ptr = ptr_u_buf
+                    else:
+                        ptr_d_buf = (ptr_d_buf + 2) % buf_total_len
+                        curr_ptr = ptr_d_buf
+
+                    for sidx in range(step_num):
+                        step = steps[sidx]
+                        # 更新具体的列索引 (sidx * 2 是为了跳过 step 的 U/D 对)
+                        out_idx = (j * step_num * 2) + (sidx * 2) + side
+
+                        # 1. 存入缓冲区
+                        if step == 0 and not np.isnan(_cnts[out_idx][i - 1]):
+                            buf_bases[curr_ptr] = _bases[out_idx][i - 1]
+                            buf_cnts[curr_ptr] = _cnts[out_idx][i - 1]
+                            buf_maxx[curr_ptr] = _maxxs[out_idx][i - 1]
+                            buf_minn[curr_ptr] = _minns[out_idx][i - 1]
+                            buf_max_cnts[curr_ptr] = _max_cnts[out_idx][i - 1]
+                            buf_min_cnts[curr_ptr] = _min_cnts[out_idx][i - 1]
+
+                        # 2. 初始化新起点
+                        _bases[out_idx][i] = val
+                        _cnts[out_idx][i] = 1
+                        _maxxs[out_idx][i] = val
+                        _minns[out_idx][i] = val
+                        _max_cnts[out_idx][i] = 1
+                        _min_cnts[out_idx][i] = 1
+
+                        # 3. 回溯
+                        for sp in range(1, step + 1):
+                            look_idx = (curr_ptr - sp * 2) % buf_total_len
+                            if np.isnan(buf_maxx[look_idx]): break
+                            b_mx, b_mn = buf_maxx[look_idx], buf_minn[look_idx]
+                            # 极值合并
+                            if (not is_rev and b_mx > _maxxs[out_idx][i]) or (is_rev and b_mx < _maxxs[out_idx][i]):
+                                _maxxs[out_idx][i] = b_mx
+                                _max_cnts[out_idx][i] = _cnts[out_idx][i] + buf_max_cnts[look_idx]
+                            if (not is_rev and b_mn < _minns[out_idx][i]) or (is_rev and b_mn > _minns[out_idx][i]):
+                                _minns[out_idx][i] = b_mn
+                                _min_cnts[out_idx][i] = _cnts[out_idx][i] + buf_min_cnts[look_idx]
+                            _cnts[out_idx][i] += buf_cnts[look_idx]
+                            _bases[out_idx][i] = buf_bases[look_idx]
+
+                        _min_cnt_ratios[out_idx][i] = (_min_cnts[out_idx][i] + L) / (_cnts[out_idx][i] + (L * 2))
+                        _max_cnt_ratios[out_idx][i] = (_max_cnts[out_idx][i] + L) / (_cnts[out_idx][i] + (L * 2))
+                else:
+                    # --- 路径 B: 增量逻辑 ---
+                    for sidx in range(step_num):
+                        out_idx = (j * step_num * 2) + (sidx * 2) + side
+                        if np.isnan(_cnts[out_idx][i - 1]):
+                            _bases[out_idx][i] = val
+                            _cnts[out_idx][i] = 1
+                            _maxxs[out_idx][i] = val
+                            _minns[out_idx][i] = val
+                            _max_cnts[out_idx][i] = 1
+                            _min_cnts[out_idx][i] = 1
+                            continue
+                        _bases[out_idx][i] = _bases[out_idx][i - 1]
+                        _cnts[out_idx][i] = _cnts[out_idx][i - 1] + 1
+                        # Maxx 增量
+                        if (not is_rev and val > _maxxs[out_idx][i - 1]) or (is_rev and val < _maxxs[out_idx][i - 1]):
+                            _maxxs[out_idx][i] = val
+                            _max_cnts[out_idx][i] = 1
+                        else:
+                            _maxxs[out_idx][i] = _maxxs[out_idx][i - 1]
+                            _max_cnts[out_idx][i] = _max_cnts[out_idx][i - 1] + 1  # 引用保持一致
+                        # Minn 增量
+                        if (not is_rev and val < _minns[out_idx][i - 1]) or (is_rev and val > _minns[out_idx][i - 1]):
+                            _minns[out_idx][i] = val
+                            _min_cnts[out_idx][i] = 1
+                        else:
+                            _minns[out_idx][i] = _minns[out_idx][i - 1]
+                            _min_cnts[out_idx][i] = _min_cnts[out_idx][i - 1] + 1
+                        _min_cnt_ratios[out_idx][i] = (_min_cnts[out_idx][i] + L) / (_cnts[out_idx][i] + (L * 2))
+                        _max_cnt_ratios[out_idx][i] = (_max_cnts[out_idx][i] + L) / (_cnts[out_idx][i] + (L * 2))
 
 
 class OhlcHandler:
@@ -1487,7 +1646,7 @@ def calc_quantile(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str,
                   df_attr: str = None) -> np.ndarray:
     ver = f"window{window}_0004"
     key = 'q' + str(quantile).replace('.', '_')
-    print(f'quantile:{key}')
+    # print(f'quantile:{key}')
     if quantile == 0.5:
         key = 'median'
     # data = _auto_load(wsconfig, f"quantile_{attr}", f'{key}', ver)
@@ -1617,7 +1776,7 @@ def mark_circle_vertexs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_
                         sides: [], mark_attr_new_names: []):
     n = len(df)
     num = len(mark_attrs)
-    _cnt = df[cnt_attr].values
+    _cnt = df[cnt_attr].values.astype('float32')
     _attrs = []
     _bases = []
     _avgs = []
@@ -1632,8 +1791,9 @@ def mark_circle_vertexs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_
                           f'{mark_attr_new_names[j]}-maxx', f'{mark_attr_new_names[j]}-minn',
                           f'{mark_attr_new_names[j]}-maxxcnt', f'{mark_attr_new_names[j]}-minncnt'])
         df.loc[:, attrs] = np.nan
+        df[attrs] = df[attrs].astype('float32')
     for j in range(0, num):
-        _attrs.append(df[mark_attrs[j]].values)
+        _attrs.append(df[mark_attrs[j]].values.astype('float32'))
         _bases.append(df[f'{mark_attr_new_names[j]}-base'].values)
         _avgs.append(df[f'{mark_attr_new_names[j]}-avg'].values)
         _maxx.append(df[f'{mark_attr_new_names[j]}-maxx'].values)
@@ -1641,6 +1801,85 @@ def mark_circle_vertexs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_
         _max_cnts.append(df[f'{mark_attr_new_names[j]}-maxxcnt'].values)
         _min_cnts.append(df[f'{mark_attr_new_names[j]}-minncnt'].values)
     _mark_circle_vertexs(_cnt, _attrs, sides, _bases, _avgs, _maxx, _max_cnts, _minn, _min_cnts, to_calc_length)
+
+
+# 2x思路下系列的生成
+def mark_circle_vertexs2(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_attr: str,
+                         mark_attrs: [], sides: [], mark_attr_new_names: [], steps: list[int], L: int):
+    n = len(df)
+    num = len(mark_attrs)
+    side_hints = ['U', 'D']
+
+    steps = sorted(list(set(steps) | {0}))
+    step_num = len(steps)
+
+    matrix_keys = ['base', 'cnt', 'maxx', 'minn', 'maxxcnt', 'minncnt']
+    ratio_keys = ['maxxcntratio', 'minncntratio']
+    all_keys = matrix_keys + ratio_keys
+
+    # --- 策略 A: 冷启动 (一次性创建并建立连续视图) ---
+    if to_calc_length >= n:
+        # 这个分支只在系统刚启动，或者需要全量重算时走一次
+        for key in all_keys:
+            total_rows = num * step_num * 2
+            big_matrix = np.full((total_rows, n), np.nan, dtype=np.float32)
+
+            current_batch_cols = []
+            cursor = 0
+            for j in range(num):
+                for step in steps:
+                    for side_h in side_hints:
+                        col_name = f'{side_h}{step}#{mark_attr_new_names[j]}-{key}'
+                        current_batch_cols.append(col_name)
+                        cursor += 1
+
+            df[current_batch_cols] = big_matrix.T
+
+    # --- 策略 B: 热运行 (处理动态增长的数据列) ---
+    # 即使列已存在且行数增加了，我们也要提取出最后一段的连续视图传给 JIT
+    def get_raw_mem_list(suffix):
+        raw_arrays = []
+        for j in range(num):
+            for step in steps:
+                for side_h in side_hints:
+                    col = f'{side_h}{step}#{mark_attr_new_names[j]}-{suffix}'
+                    # 获取底层 numpy 数组的视图
+                    raw_arrays.append(df[col].values)
+        return raw_arrays
+
+    # 提取输入（只取需要计算的末尾部分）
+    _cnt = df[cnt_attr].values.astype('float32')
+    _exist_attrs = df.columns.values.tolist()
+    _attrs = [df[m].values.astype('float32') for m in mark_attrs if m in _exist_attrs]
+    _sides = np.array(sides, dtype=np.float32)
+    _steps = np.array(steps)
+
+    # 提取所有工作矩阵
+    m_args = {key: get_raw_mem_list(key) for key in all_keys}
+
+    _mark_circle_vertexs2(
+        _cnt, _attrs, _sides,
+        m_args['base'], m_args['maxx'], m_args['minn'],
+        # m_args['maxxratio'], m_args['minnratio'],
+        m_args['maxxcnt'], m_args['minncnt'],  # 注意 JIT 签名里的命名对应
+        m_args['maxxcntratio'], m_args['minncntratio'],
+        m_args['cnt'], _steps, L, to_calc_length
+    )
+    # --- 关键：热运行下的数据同步回填 ---
+    # 如果 to_calc_length < n，说明我们是在一个副本切片上做的计算
+    # 必须把计算结果写回 df 的末尾
+    if to_calc_length < n:
+        start_idx = n - to_calc_length
+        for key in all_keys:
+            matrix = m_args[key]
+            cursor = 0
+            for j in range(num):
+                for step in steps:
+                    for side_h in side_hints:
+                        col = f'{side_h}{step}#{mark_attr_new_names[j]}-{key}'
+                        # 只写回末尾计算的部分
+                        df[col].values[start_idx:] = matrix[cursor, start_idx:]
+                        cursor += 1
 
 
 def mark_circle_avgs(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt_attr: str, mark_attrs: [],
@@ -1939,7 +2178,7 @@ def calculate_qnrscore(df: DataFrame, wsconfig: dict, to_calc_length: int,
         return df
     n = len(df)
     if to_calc_length >= n:
-        df[qnr_attr] = np.full(n, np.nan, dtype=np.float64)
+        df[qnr_attr] = np.full(n, np.nan, dtype=np.float32)
     _attr = df[attr].values
     _qns = df[qnr_attr].values
     if to_calc_length >= n:
@@ -1979,7 +2218,7 @@ def calculate_qnrscore(df: DataFrame, wsconfig: dict, to_calc_length: int,
 def _mark_extreme_memory(attrs: [], vertex_attrs: [],
                          mems: [], durations: [], vertexes: [], vertex_mems: [],
                          mems_prev: [], durations_prev: [], vertexes_prev: [], vertex_mems_prev: [],
-                         timeperoid: int, extremes: list[np.float64], to_calc_length):
+                         timeperoid: int, extremes: list[np.float32], to_calc_length: int):
     n = len(attrs[0])
     num = len(attrs)
     n_start = max(n - to_calc_length, 0)
@@ -2022,7 +2261,7 @@ def _mark_extreme_memory(attrs: [], vertex_attrs: [],
             switch = False
             if np.abs(attr[i]) > extreme:
                 _sign = np.sign(attr[i])
-                if np.abs(mem[i-1]) < 0.9 or np.sign(mem[i-1]) != _sign:
+                if np.abs(mem[i - 1]) < 0.9 or np.sign(mem[i - 1]) != _sign:
                     switch = True
                 mem[i] = _sign
                 if duration is not None:
@@ -2109,8 +2348,8 @@ def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
         _vertexes_prev = None
         _vertex_mems_prev = None
     for i in range(0, len(attrs)):
-        _attrs[i] = df[attrs[i]].values
-        _vertex_attrs[i] = df[vertex_attrs[i]].values
+        _attrs[i] = df[attrs[i]].values.astype('float32')
+        _vertex_attrs[i] = df[vertex_attrs[i]].values.astype('float32')
     n = len(df)
     if to_calc_length >= n:
         # extreme 的mem，duration原值， duration的mem，极值原始值，极值的mem乘以原始值
@@ -2119,7 +2358,7 @@ def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
             multi = multi - 1
         if with_vertex is False:
             multi = multi - 2
-        array = np.full((n, len(attrs) * multi * 2), 0.0)
+        array = np.full((n, len(attrs) * multi * 2), 0.0, dtype='float32')
         for i in range(0, len(n_attrs)):
             df[f'{n_attrs[i]}-mem'] = array[:, i * multi * 2]
             df[f'{n_attrs[i]}-mem-prev'] = array[:, i * multi * 2 + 1]
@@ -2127,10 +2366,10 @@ def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
                 df[f'{n_attrs[i]}-duration'] = array[:, i * multi * 2 + 2]
                 df[f'{n_attrs[i]}-duration-prev'] = array[:, i * multi * 2 + 3]
             if with_vertex is True:
-                df[f'{n_attrs[i]}-vertex'] = array[:, (i+1) * multi * 2 - 4]
-                df[f'{n_attrs[i]}-vertexmem'] = array[:, (i+1) * multi * 2 - 3]
-                df[f'{n_attrs[i]}-vertex-prev'] = array[:, (i+1) * multi * 2 - 2]
-                df[f'{n_attrs[i]}-vertexmem-prev'] = array[:, (i+1) * multi * 2 - 1]
+                df[f'{n_attrs[i]}-vertex'] = array[:, (i + 1) * multi * 2 - 4]
+                df[f'{n_attrs[i]}-vertexmem'] = array[:, (i + 1) * multi * 2 - 3]
+                df[f'{n_attrs[i]}-vertex-prev'] = array[:, (i + 1) * multi * 2 - 2]
+                df[f'{n_attrs[i]}-vertexmem-prev'] = array[:, (i + 1) * multi * 2 - 1]
     for i in range(0, len(attrs)):
         _mems[i] = df[f'{n_attrs[i]}-mem'].values
         _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
@@ -2142,10 +2381,11 @@ def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
             _vertex_mems[i] = df[f'{n_attrs[i]}-vertexmem'].values
             _vertexes_prev[i] = df[f'{n_attrs[i]}-vertex-prev'].values
             _vertex_mems_prev[i] = df[f'{n_attrs[i]}-vertexmem-prev'].values
+    extremes_f32 = [np.float32(x) for x in extremes]
     _mark_extreme_memory(_attrs, _vertex_attrs,
                          _mems, _durations, _vertexes, _vertex_mems,
                          _mems_prev, _durations_prev, _vertexes_prev, _vertex_mems_prev,
-                         timeperoid, extremes, to_calc_length)
+                         timeperoid, extremes_f32, to_calc_length)
     return df
 
 
@@ -2160,10 +2400,10 @@ def mark_neutral_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
     _mems_prev = [None] * num
     _durations_prev = [None] * num
     for i in range(0, len(attrs)):
-        _attrs[i] = df[attrs[i]].values
+        _attrs[i] = df[attrs[i]].values.astype('float32')
     n = len(df)
     if to_calc_length >= n:
-        array = np.full((n, len(attrs) * 4), 0.0)
+        array = np.full((n, len(attrs) * 4), 0.0, dtype='float32')
         for i in range(0, len(n_attrs)):
             df[f'{n_attrs[i]}-mem'] = array[:, i * 4]
             df[f'{n_attrs[i]}-duration'] = array[:, i * 4 + 1]
@@ -2174,12 +2414,13 @@ def mark_neutral_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
         _durations[i] = df[f'{n_attrs[i]}-duration'].values
         _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
         _durations_prev[i] = df[f'{n_attrs[i]}-duration-prev'].values
-    _mark_neutral_memory(_attrs, _mems, _durations, _mems_prev, _durations_prev, timeperoid, params, to_calc_length)
+    params_f32 = [np.float32(x) for x in params]
+    _mark_neutral_memory(_attrs, _mems, _durations, _mems_prev, _durations_prev, timeperoid, params_f32, to_calc_length)
     return df
 
 
 @nb.njit
-def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], durations_prev: [], timeperoid: int, params: list[np.float64],
+def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], durations_prev: [], timeperoid: int, params: list[np.float32],
                          to_calc_length: int):
     n = len(attrs[0])
     num = len(attrs)
@@ -2202,7 +2443,7 @@ def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], dura
             switch = False
             if np.abs(attr[i]) < param:
                 _sign = np.sign(attr[i])
-                if np.abs(mem[i-1]) < 0.9 or np.sign(mem[i-1]) != _sign:
+                if np.abs(mem[i - 1]) < 0.9 or np.sign(mem[i - 1]) != _sign:
                     switch = True
                 mem[i] = _sign
                 if switch:
@@ -2219,20 +2460,19 @@ def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], dura
                 duration_prev[i] = duration[i - 1]
                 if np.abs(mem_prev[i]) < m_cut:
                     mem_prev[i] = 0
-            elif mem_prev[i-1] != 0:
+            elif mem_prev[i - 1] != 0:
                 mem_prev[i] = mem_prev[i - 1] * m_0
                 duration_prev[i] = duration_prev[i - 1]
                 if np.abs(mem_prev[i]) < m_cut:
                     mem_prev[i] = 0
 
 
-
-
 def mark_extreme_integral(df: DataFrame, wsconfig: dict, to_calc_length: int,
-                          attrs: list[str], n_attrs: list[str], timeperoid: int, params: list[np.float64]) -> DataFrame:
+                          attrs: list[str], n_attrs: list[str], sma_length: int, params: list[np.float64]) -> DataFrame:
     num = len(attrs)
     if num == 0:
         return df
+    _means = [None] * num
     _attrs = [None] * num
     _integs = [None] * num
     _amounts = [None] * num
@@ -2240,20 +2480,57 @@ def mark_extreme_integral(df: DataFrame, wsconfig: dict, to_calc_length: int,
         _attrs[i] = df[attrs[i]].values
     n = len(df)
     if to_calc_length >= n:
-        array = np.full((n, len(attrs) * 2), 0.0)
+        array = np.full((n, len(attrs) * 2), 0.0, dtype='float32')
         for i in range(0, len(n_attrs)):
             df[f'{n_attrs[i]}-integral'] = array[:, i * 2]
             df[f'{n_attrs[i]}-amount'] = array[:, i * 2 + 1]
     for i in range(0, len(attrs)):
+        _means[i] = ta.SMA(df[f'{attrs[i]}'], timeperiod=sma_length)
         _integs[i] = df[f'{n_attrs[i]}-integral'].values
         _amounts[i] = df[f'{n_attrs[i]}-amount'].values
-    _mark_extreme_integral(_attrs, _integs, _amounts, timeperoid, params, to_calc_length)
+    _mark_extreme_integral(_attrs, _means, _integs, _amounts, sma_length, params, to_calc_length)
     return df
 
 
 @nb.njit
-def _mark_extreme_integral(attrs: [], integs: [], amounts: [], timeperoid: int, params: list[np.float64],
+def _mark_extreme_integral(attrs: [], means: [], integs: [], amounts: [], sma_length: int, params: list[np.float64],
                            to_calc_length: int):
+    n = len(attrs[0])
+    num = len(attrs)
+    n_start = max(n - to_calc_length, sma_length)
+    for j in range(0, num):
+        attr = attrs[j]
+        mean = means[j]
+        integ = integs[j]
+        amount = amounts[j]
+        param = params[j]
+        for i in range(n_start, n):
+            if i == 0:
+                last_integ = 0
+                last_amount = 0
+            else:
+                last_integ = integ[i - 1]
+                last_amount = amount[i - 1]
+            dif = np.abs(attr[i]) - np.abs(mean[i])
+            if np.abs(attr[i]) > param or (dif < 0 and integ[i] != 0):
+                _sign = np.sign(attr[i])
+                if np.sign(last_integ) != _sign:
+                    last_integ = 0
+                    last_amount = 0
+                if np.abs(last_integ) + dif < 0:
+                    integ[i] = 0
+                    amount[i] = 0
+                else:
+                    integ[i] = (_sign * dif) + last_integ
+                    amount[i] = last_amount + 1
+            else:
+                integ[i] = last_integ
+                amount[i] = last_amount
+
+
+@nb.njit
+def _mark_extreme_integral_old(attrs: [], integs: [], amounts: [], timeperoid: int, params: list[np.float64],
+                               to_calc_length: int):
     n = len(attrs[0])
     num = len(attrs)
     n_start = max(n - to_calc_length, 0)
@@ -2280,7 +2557,7 @@ def _mark_extreme_integral(attrs: [], integs: [], amounts: [], timeperoid: int, 
             if i > timeperoid:
                 difx = np.abs(attr[i - timeperoid]) - param
                 if difx > 0:
-                    _signx = 0 - np.sign(attr[i])
+                    _signx = 0 - np.sign(attr[i - timeperoid])
                     integ[i] = _signx * difx + integ[i]
 
 
@@ -2305,6 +2582,7 @@ def _calculate_ratr(_attr, _n_attr, timeperiod, to_calc_length):
         _n_attr[i] = _n_attr[i - 1] + (tr - _n_attr[i - 1]) / timeperiod
 
 
+# 根据每时间周期平均close变化计算的等效ATR
 def calculate_ratr(df: DataFrame, wsconfig: dict, to_calc_length: int,
                    attr: str, n_attr: str, timeperiod: int) -> DataFrame:
     n = len(df)
@@ -2460,11 +2738,11 @@ def _calculate_rolling_hurst_numba(log_returns_full, window_size):
 def _mark_next_ups(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax: int):
     n = len(values)
     for i in range(0, n):
-        _end = min(n, i+timemax)
+        _end = min(n, i + timemax)
         _v = values[i] + gaps[i]
         for j in range(i, _end):
             if values[j] >= _v:
-                rs[i] = j-i
+                rs[i] = j - i
                 break
 
 
@@ -2472,11 +2750,11 @@ def _mark_next_ups(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax
 def _mark_next_downs(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax: int):
     n = len(values)
     for i in range(0, n):
-        _end = min(n, i+timemax)
+        _end = min(n, i + timemax)
         _v = values[i] - gaps[i]
         for j in range(i, _end):
             if values[j] <= _v:
-                rs[i] = j-i
+                rs[i] = j - i
                 break
 
 
@@ -2484,8 +2762,8 @@ def mark_next_ups(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax: i
                   attr: str = None) -> np.ndarray:
     _display_attr = 'None' if attr is None else attr
     ver = f"0003_timemax_{timemax}_param_{param}_optimized"
-    #load = _auto_load(wsconfig, "mark_next_ups", _display_attr, ver)
-    #if load is not None:
+    # load = _auto_load(wsconfig, "mark_next_ups", _display_attr, ver)
+    # if load is not None:
     #    return load
     if attr is None:
         gaps = np.full(len(df), param, dtype=np.float64)
@@ -2493,16 +2771,16 @@ def mark_next_ups(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax: i
         gaps = df[attr].values * param
     ups = np.full(len(df), timemax, dtype=np.float64)
     _mark_next_ups(df['close'].values, gaps, ups, timemax)
-    #_auto_save(wsconfig, ups, "mark_next_ups", _display_attr, ver)
+    # _auto_save(wsconfig, ups, "mark_next_ups", _display_attr, ver)
     return ups
 
 
 def mark_next_downs(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax: int, param: np.float64,
-                  attr: str = None) -> np.ndarray:
+                    attr: str = None) -> np.ndarray:
     _display_attr = 'None' if attr is None else attr
     ver = f"0003_timemax_{timemax}_param_{param}_optimized"
-    #load = _auto_load(wsconfig, "mark_next_downs", _display_attr, ver)
-    #if load is not None:
+    # load = _auto_load(wsconfig, "mark_next_downs", _display_attr, ver)
+    # if load is not None:
     #    return load
     if attr is None:
         gaps = np.full(len(df), param, dtype=np.float64)
@@ -2510,6 +2788,35 @@ def mark_next_downs(df: DataFrame, wsconfig: dict, to_calc_length: int, timemax:
         gaps = df[attr].values * param
     dps = np.full(len(df), timemax, dtype=np.float64)
     _mark_next_downs(df['close'].values, gaps, dps, timemax)
-    #_auto_save(wsconfig, ups, "mark_next_downs", _display_attr, ver)
+    # _auto_save(wsconfig, ups, "mark_next_downs", _display_attr, ver)
     return dps
 
+
+@nb.njit
+def _calculate_circle_length_ema(sides: np.ndarray, emas: np.ndarray, init_avg: np.float64, alpha=0.01):
+    n = len(sides)
+    last_trigger_idx = -1
+    avg = init_avg
+    emas[0] = avg
+    for i in range(1, n):
+        # 探测 -1 -> 1 的翻转瞬间
+        if sides[i - 1] == -1 and sides[i] == 1:
+            if last_trigger_idx == -1:
+                # 第一次发现翻转，无法计算距离，仅记录索引
+                last_trigger_idx = i
+            else:
+                # 计算两个翻转点之间的行数距离
+                cycle_len = i - last_trigger_idx
+                avg = avg + (cycle_len - avg) * alpha
+                last_trigger_idx = i
+        emas[i] = avg
+
+
+def calculate_circle_length_ema(df: DataFrame, wsconfig: dict, to_calc_length: int,
+                                side_attr: str, ema_attr: str,
+                                init_avg: np.float64, alpha=0.01) -> DataFrame:
+    n = len(df)
+    if to_calc_length >= n:
+        df[ema_attr] = np.full(n, 0, dtype=np.float64)
+    _calculate_circle_length_ema(df[side_attr].values, df[ema_attr].values, init_avg, alpha=alpha)
+    return df
