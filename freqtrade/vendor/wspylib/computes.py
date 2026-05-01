@@ -22,6 +22,7 @@ import math
 
 import numpy as np  # noqa
 import numba as nb
+from numba import njit
 from numba.typed import List
 import pandas as pd  # noqa
 import talib.abstract as ta
@@ -34,7 +35,17 @@ warnings.simplefilter(action="ignore", category=RuntimeWarning)
 
 
 # =============================================
+@nb.jit(nopython=True)
+def _ema_kernel(data, span):
+    n = data.shape[0]
+    out = np.zeros(n)
+    alpha = 2.0 / (span + 1.0)
 
+    if n > 0:
+        out[0] = data[0]  # 初始化
+        for i in range(1, n):
+            out[i] = data[i] * alpha + out[i - 1] * (1.0 - alpha)
+    return out
 
 @nb.jit(nopython=True)
 def _mark_mm_core(
@@ -434,11 +445,19 @@ def _mark_boundary_core(
 
 
 @nb.jit(nopython=True)
-def _calc_mean(value: np.ndarray, mean: np.ndarray, init_value: np.ndarray, timeperiod: int, to_calc_length: int):
+def _calc_mean(value: np.ndarray, mean: np.ndarray, init_value: np.float64, timeperiod: int, to_calc_length: int):
     n = len(value)
     start = max(n - to_calc_length, 1)
     if to_calc_length >= n:
         mean[0] = init_value
+        if np.isnan(mean[0]):
+            mean[0] = 0.0
+        for i in range(1, timeperiod):
+            if np.isnan(value[i]):
+                mean[i] = mean[i - 1]
+                continue
+            mean[i] = mean[i - 1] + ((value[i] - mean[i - 1]) / i)
+        start = timeperiod
     for i in range(start, n):
         if np.isnan(value[i]):
             mean[i] = mean[i - 1]
@@ -650,7 +669,7 @@ def _mark_circle_vertexs2(cnt: np.ndarray, attrs: [], signs: np.ndarray, _bases:
     for s in steps:
         if s > circle_num:
             circle_num = s
-    safe_circle_num = max(circle_num, 1)
+    safe_circle_num = max(circle_num+1, 1)
     buf_total_len = safe_circle_num * 2
     # 使用 prange 对不同特征并行处理
     for j in nb.prange(mark_num):
@@ -745,7 +764,7 @@ def _mark_circle_vertexs2(cnt: np.ndarray, attrs: [], signs: np.ndarray, _bases:
                         _min_cnts[out_idx][i] = 1
 
                         # 3. 回溯
-                        for sp in range(1, step + 1):
+                        for sp in range(0, step):
                             look_idx = (curr_ptr - sp * 2) % buf_total_len
                             if np.isnan(buf_maxx[look_idx]): break
                             b_mx, b_mn = buf_maxx[look_idx], buf_minn[look_idx]
@@ -1246,36 +1265,65 @@ def mark_flines_numba(config: dict, df: DataFrame, threshold=5.0, col_num=9):
     df[f'dline-{col_num}'] = (df[f'fline-{col_num}'] - df[f'fline-{col_num - 1}'])
 
 
-def calc_rank(config: dict, df: DataFrame, attr: str, window: int, rank_attr: str, to_calc_length: int):
+@njit
+def _rolling_rank_inplace_kernel(values, target, window, to_calc_length):
+    """
+    values: 输入数据数组
+    target: 输出结果数组 (视图)
+    window: 窗口大小
+    to_calc_length: 需要更新的末尾长度
+    """
+    n = len(values)
+    # 计算起始位置，确保不越界
+    start_pos = max(window - 1, n - to_calc_length)
+
+    for i in range(start_pos, n):
+        # 获取当前窗口
+        # 注意：Numba 切片不产生副本，性能极高
+        current_val = values[i]
+        count = 0
+        # 手动计算排名 (Percent Rank 逻辑)
+        for j in range(i - window + 1, i + 1):
+            if values[j] <= current_val:
+                count += 1
+        target[i] = (count / window) * 100
+
+
+def calc_rank(config: dict, df: pd.DataFrame, attr: str, window: int, rank_attr: str, to_calc_length: int):
     ver = f"{attr}_{window}_0001"
-    rank = _auto_load(config, "calc_rank", "rank", ver)
-    fullloaded = (rank is not None)
-    if not fullloaded:
-        n = len(df)
-        m = to_calc_length
-        if to_calc_length >= n:
-            rank = df[attr].rolling(
-                window=window,
-                min_periods=window  # 确保只有在有 N 个完整数据点时才开始计算
-            ).apply(
-                lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
-                raw=False  # 确保 apply 接收 Series 对象
-            )
-            df[rank_attr] = rank
-        else:
-            size = min(to_calc_length + window + 1, n)
-            df.loc[df.index[-m:], rank_attr] = df[attr].iloc[-size].rolling(
-                window=window,
-                min_periods=window  # 确保只有在有 N 个完整数据点时才开始计算
-            ).apply(
-                lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100,
-                raw=False  # 确保 apply 接收 Series 对象
-            ).iloc[-m]
-            rank = df[rank_attr].value
-        _auto_save(config, rank, "calc_rank", "rank", ver)
+    # 1. 尝试从本地加载缓存数据
+    cached_rank = _auto_load(config, "calc_rank", "rank", ver)
+
+    # 2. 防御性初始化：确保列已在内存中“占坑”
+    # 这是保证外部指针（如 Java 端或监控模块）能读到新列的关键
+    if rank_attr not in df.columns:
+        df[rank_attr] = np.nan
+
+    # 获取指向 df 内部内存的视图
+    target_view = df[rank_attr].values
+    n = len(df)
+
+    if cached_rank is not None:
+        # --- 场景 A: 存在缓存 ---
+        # 必须使用 [:] 原地填充，严禁直接 df[rank_attr] = cached_rank
+        # 长度校验，防止缓存与当前 df 长度不符
+        fill_len = min(len(cached_rank), n)
+        target_view[-fill_len:] = cached_rank[-fill_len:]
     else:
-        df[rank_attr] = rank
-    return df
+        # --- 场景 B: 需要计算 ---
+        input_values = df[attr].values
+
+        if to_calc_length >= n:
+            # 全量计算：先重置内存内容
+            target_view[:] = np.nan
+            _rolling_rank_inplace_kernel(input_values, target_view, window, n)
+        else:
+            # 增量计算：只修改末尾部分，前面保持不变
+            _rolling_rank_inplace_kernel(input_values, target_view, window, to_calc_length)
+
+        # 保存计算结果（保存整个数组或当前状态）
+        # 注意：这里传的是副本，防止异步保存时原始 df 被修改
+        _auto_save(config, target_view.copy(), "calc_rank", "rank", ver)
 
 
 def mark_boundary_numba(config: dict, df: DataFrame, to_calc_length, threshold=5.0):
@@ -1642,39 +1690,58 @@ def gaussian(src: np.ndarray, dst: np.ndarray, lookback: int, startAtBar: int, t
     return dst
 
 
-def calc_quantile(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int, quantile: np.float64,
+def calc_quantile(df: pd.DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int, quantile: np.float64,
                   df_attr: str = None) -> np.ndarray:
     ver = f"window{window}_0004"
-    key = 'q' + str(quantile).replace('.', '_')
-    # print(f'quantile:{key}')
-    if quantile == 0.5:
-        key = 'median'
-    # data = _auto_load(wsconfig, f"quantile_{attr}", f'{key}', ver)
-    data = None
+    key = 'median' if quantile == 0.5 else 'q' + str(quantile).replace('.', '_')
+
+    # 1. 确定特征名称
+    feature_name = df_attr if df_attr else f'_{attr}-quantile-{window}-{key}'
+
+    # 2. 防御性初始化：确保列在内存中占坑
+    if feature_name not in df.columns:
+        df[feature_name] = np.nan
+
+    # 获取原始内存视图，保证外部指针同步
+    target_view = df[feature_name].values
     n = len(df)
-    if data is None:
+
+    # 3. 加载缓存 (此处假设 _auto_load 逻辑开启)
+    data = _auto_load(wsconfig, f"quantile_{attr}", f'{key}', ver)
+
+    if data is not None:
+        fill_len = min(len(data), n)
+        target_view[-fill_len:] = data[-fill_len:]
+    else:
+        # 4. 核心计算逻辑
         if to_calc_length >= n:
+            # --- 全量计算 ---
             if quantile == 0.5:
-                data = df[attr].rolling(window=window).median()
+                res = df[attr].rolling(window=window).median()
             else:
-                data = df[attr].rolling(window=window).quantile(quantile)
+                res = df[attr].rolling(window=window).quantile(quantile)
+            # 必须使用 [:] 保证原地覆盖，不丢失物理地址
+            target_view[:] = res.values
         else:
+            # --- 增量计算 ---
+            # 仅计算末尾必要的长度，减少计算量
             m = to_calc_length
-            roll_size = max(n, m + window)
-            if df_attr is None:
-                feature_name = f'_{attr}-quantile-{window}-{key}'
-            else:
-                feature_name = df_attr
+            # 为了计算最后 m 个点的分位数，需要前溯 window-1 个点
+            calc_slice = df[attr].iloc[-(m + window - 1):]
+
             if quantile == 0.5:
-                df.loc[df.index[-m:], feature_name] = \
-                    df[attr].iloc[-roll_size:].rolling(window=window).median()[-m]
+                res = calc_slice.rolling(window=window).median()
             else:
-                df.loc[df.index[-m:], feature_name] = \
-                    df[attr].iloc[-roll_size:].rolling(window=window).quantile(quantile)[-m]
-            data = df[feature_name].values
-            print(f'feature_name={feature_name}')
-        _auto_save(wsconfig, data, f"quantile_{attr}", f'{key}', ver)
-    return data
+                res = calc_slice.rolling(window=window).quantile(quantile)
+
+            # 只更新末尾 m 个值，保持前面的数据不动
+            target_view[-m:] = res.values[-m:]
+
+        # 5. 统一保存：保存的是已经修改好的数组
+        _auto_save(wsconfig, target_view, f"quantile_{attr}", f'{key}', ver)
+
+    # 统一返回 numpy 数组视图
+    return target_view
 
 
 def calculate_hma(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperiod: int) -> pd.Series:
@@ -1708,67 +1775,53 @@ def calculate_long_mean(df: DataFrame, wsconfig: dict, to_calc_length: int,
     n = len(df)
     if mean_attr is None:
         mean_attr = f'{attr}-mean-{timeperiod}'
-    if to_calc_length >= n:
-        mean = np.full(n, np.nan)
-    else:
-        mean = df[mean_attr].values
+    if mean_attr not in df.columns:
+        df[mean_attr] = np.nan
+    mean = df[mean_attr].values
     value = df[attr].values
     _calc_mean(value, mean, init_value, timeperiod, to_calc_length)
-    df[mean_attr] = mean
-    return df
 
 
 def mark_hit_band(df: DataFrame, wsconfig: dict, to_calc_length: int,
                   attr_h: str, attr_l: str, close: str, step: int = 5, step_max: int = 20,
                   tgt_attr: str = None, tgt_cnt_attr: str = None):
-    n = len(df)
     if tgt_attr is None:
         tgt_attr = f'{attr_h}-bhit'
     if tgt_cnt_attr is None:
         tgt_cnt_attr = f'{tgt_attr}-cnt'
-    if to_calc_length >= n:
-        hit = np.full(n, np.nan)
-        hitcnt = np.zeros(n)
-    else:
-        hit = df[tgt_attr].values
-        hitcnt = df[tgt_cnt_attr].values
+    if tgt_attr not in df.columns:
+        df[tgt_attr] = np.nan
+    if tgt_cnt_attr not in df.columns:
+        df[tgt_cnt_attr] = 0
+    hit = df[tgt_attr].values
+    hitcnt = df[tgt_cnt_attr].values
     _mark_hit_band(df[attr_h].values, df[attr_l].values, df[close].values, hit, hitcnt, step, step_max, to_calc_length)
-    df[tgt_attr] = hit
-    df[tgt_cnt_attr] = hitcnt
-    return df
 
 
 def mark_hit_line(df: DataFrame, wsconfig: dict, to_calc_length: int,
                   attr: str, close: str, step_max: int = 30, tgt_attr: str = None):
-    n = len(df)
     if tgt_attr is None:
         tgt_attr = f'{attr}-hit'
-    if to_calc_length >= n:
-        hit = np.zeros(n)
-    else:
-        hit = df[tgt_attr].values
+    if tgt_attr not in df.columns:
+        df[tgt_attr] = 0
+    hit = df[tgt_attr].values
     _mark_hit_line(df[attr].values, df[close].values, hit, step_max, to_calc_length)
     df[tgt_attr] = hit
-    return df
 
 
 def mark_circle_base(df: DataFrame, wsconfig: dict, to_calc_length: int, side_attr: str,
                      idx_attr: str = None, cnt_attr: str = None):
-    n = len(df)
     if idx_attr is None:
         idx_attr = side_attr.replace('side', 'idx')
     if cnt_attr is None:
         cnt_attr = side_attr.replace('side', 'cnt')
-    if to_calc_length >= n:
-        idx = np.zeros(n)
-        cnt = np.zeros(n)
-    else:
-        idx = df[idx_attr].values
-        cnt = df[cnt_attr].values
+    if idx_attr not in df.columns:
+        df[idx_attr] = 0
+    if cnt_attr not in df.columns:
+        df[cnt_attr] = 0
+    idx = df[idx_attr].values
+    cnt = df[cnt_attr].values
     _mark_circle_base(df[side_attr].values, idx, cnt, to_calc_length)
-    df[idx_attr] = idx
-    df[cnt_attr] = cnt
-    return df
 
 
 # chapter系列的生成
@@ -1850,6 +1903,7 @@ def mark_circle_vertexs2(df: DataFrame, wsconfig: dict, to_calc_length: int, cnt
     # 提取输入（只取需要计算的末尾部分）
     _cnt = df[cnt_attr].values.astype('float32')
     _exist_attrs = df.columns.values.tolist()
+    print(set(_exist_attrs) & set(mark_attrs))
     _attrs = [df[m].values.astype('float32') for m in mark_attrs if m in _exist_attrs]
     _sides = np.array(sides, dtype=np.float32)
     _steps = np.array(steps)
@@ -1906,7 +1960,6 @@ def calculate_rank(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str
     if rank_attr is None:
         rank_attr = f'{attr}-rank-{window}'
     calc_rank(wsconfig, df, attr, window, rank_attr, to_calc_length)
-    return df
 
 
 def calculate_dstr(df: DataFrame, wsconfig: dict, to_calc_length: int,
@@ -1919,26 +1972,44 @@ def calculate_dstr(df: DataFrame, wsconfig: dict, to_calc_length: int,
 
 
 def calculate_quantile(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int, quantile: np.float64,
-                       quantile_attr: str) -> DataFrame:
-    data = calc_quantile(df, wsconfig, to_calc_length, attr, window, quantile, df_attr=quantile_attr)
-    df[quantile_attr] = data
-    return df
+                       quantile_attr: str):
+    calc_quantile(df, wsconfig, to_calc_length, attr, window, quantile, df_attr=quantile_attr)
 
 
 def calculate_iqrscore(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, window: int,
-                       iqr_attr: str = None, median_attr: str = None) -> DataFrame:
+                       iqr_attr: str = None, median_attr: str = None):
     if iqr_attr is None:
         iqr_attr = f'{attr}-iqrscore-{window}'
+
+    # 1. 确保列占坑，保持外部指针同步
+    if iqr_attr not in df.columns:
+        df[iqr_attr] = np.nan
+
+    # 2. 调用重构后的 calc_quantile (内部已处理好原地更新)
     q3 = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.75)
     q1 = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.25)
     media = calc_quantile(df, wsconfig, to_calc_length, attr, window, 0.5, df_attr=median_attr)
+
+    target_view = df[iqr_attr].values
+    val_view = df[attr].values
     n = len(df)
-    if to_calc_length >= n:
-        df[iqr_attr] = (df[attr] - media) / (q3 - q1)
+    m = to_calc_length
+
+    # 3. 执行计算逻辑
+    if m >= n:
+        # 全量计算
+        diff = q3 - q1
+        # 防御性处理：防止除以 0
+        target_view[:] = np.where(diff != 0, (val_view - media) / diff, 0.0)
     else:
-        m = to_calc_length
-        df.loc[df.index[-m:], iqr_attr] = (df[attr].values[-m] - media[-m]) / (q3[-m] - q1[-m])
-    return df
+        # 增量计算：注意使用 [-m:] 切片而非 [-m] 单索引
+        v_part = val_view[-m:]
+        m_part = media[-m:]
+        diff_part = q3[-m:] - q1[-m:]
+
+        # 原地更新最后 m 个点
+        target_view[-m:] = np.where(diff_part != 0, (v_part - m_part) / diff_part, 0.0)
+
 
 
 @nb.njit
@@ -2175,7 +2246,7 @@ def calculate_qnrscore(df: DataFrame, wsconfig: dict, to_calc_length: int,
     # load = _auto_load(wsconfig, "calculate_qnrscore", attr, ver)
     if load is not None:
         df[qnr_attr] = load
-        return df
+        return
     n = len(df)
     if to_calc_length >= n:
         df[qnr_attr] = np.full(n, np.nan, dtype=np.float32)
@@ -2211,7 +2282,6 @@ def calculate_qnrscore(df: DataFrame, wsconfig: dict, to_calc_length: int,
     else:
         _calculate_qnrscore(_attr, _qns, window, to_calc_length)
     _auto_save(wsconfig, _qns, "calculate_qnrscore", attr, ver)
-    return df
 
 
 @nb.njit
@@ -2321,103 +2391,123 @@ def _mark_extreme_memory(attrs: [], vertex_attrs: [],
 
 
 def mark_extreme_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
-                        attrs: list[str], vertex_attrs: list[str], n_attrs: list[str], timeperoid: int,
+                        attrs: list[str], vertex_attrs: list[str], n_attrs: list[str], timeperiod: int,
                         extremes: list[np.float64],
-                        with_dure=True, with_vertex=True) -> DataFrame:
+                        with_dure=True, with_vertex=True):
     num = len(attrs)
     if num == 0:
-        return df
+        return
+    n = len(df)
     _attrs = [None] * num
     _mems = [None] * num
     _mems_prev = [None] * num
     _vertex_attrs = [None] * num
-    if with_dure is True:
-        _durations = [None] * num
-        _durations_prev = [None] * num
+    # 1. 定义需要生成的列后缀
+    suffixes = ['-mem', '-mem-prev']
+    if with_dure:
+        suffixes += ['-duration', '-duration-prev']
+    if with_vertex:
+        suffixes += ['-vertex', '-vertexmem', '-vertex-prev', '-vertexmem-prev']
+
+    # 2. 防御性初始化：确保所有列拥有【独立】的内存空间
+    for n_attr in n_attrs:
+        for suffix in suffixes:
+            col = n_attr + suffix
+            if col not in df.columns:
+                # 关键：每一列都要独立初始化，防止内存共享
+                df[col] = np.float32(0.0)
+    # 3. 准备视图列表 (Views) - 直接指向 df 的物理地址
+    # 辅助函数：确保拿到的是 float32 视图，避免副本
+    def get_f32_view(name):
+        # 如果类型不对，建议在外部统一转换，此处做个防御
+        if df[name].dtype != np.float32:
+            df[name] = df[name].astype(np.float32)
+        return df[name].values
+
+    _attrs = [get_f32_view(a) for a in attrs]
+    _v_attrs = [get_f32_view(va) for va in vertex_attrs]
+
+    _mems = [get_f32_view(f'{na}-mem') for na in n_attrs]
+    _mems_p = [get_f32_view(f'{na}-mem-prev') for na in n_attrs]
+
+    _durations = [get_f32_view(f'{na}-duration') for na in n_attrs] if with_dure else None
+    _durations_p = [get_f32_view(f'{na}-duration-prev') for na in n_attrs] if with_dure else None
+
+    if with_vertex:
+        _vertexes = [get_f32_view(f'{na}-vertex') for na in n_attrs]
+        _v_mems = [get_f32_view(f'{na}-vertexmem') for na in n_attrs]
+        _vertexes_p = [get_f32_view(f'{na}-vertex-prev') for na in n_attrs]
+        _v_mems_p = [get_f32_view(f'{na}-vertexmem-prev') for na in n_attrs]
     else:
-        _durations = None
-        _durations_prev = None
-    if with_vertex is True:
-        _vertexes = [None] * num
-        _vertex_mems = [None] * num
-        _vertexes_prev = [None] * num
-        _vertex_mems_prev = [None] * num
-    else:
-        _vertexes = None
-        _vertex_mems = None
-        _vertexes_prev = None
-        _vertex_mems_prev = None
-    for i in range(0, len(attrs)):
-        _attrs[i] = df[attrs[i]].values.astype('float32')
-        _vertex_attrs[i] = df[vertex_attrs[i]].values.astype('float32')
-    n = len(df)
+        _vertexes = _v_mems = _vertexes_p = _v_mems_p = None
+
+    # 4. 全量计算时的重置 (原地修改内容 [:] )
     if to_calc_length >= n:
-        # extreme 的mem，duration原值， duration的mem，极值原始值，极值的mem乘以原始值
-        multi = 4
-        if with_dure is False:
-            multi = multi - 1
-        if with_vertex is False:
-            multi = multi - 2
-        array = np.full((n, len(attrs) * multi * 2), 0.0, dtype='float32')
-        for i in range(0, len(n_attrs)):
-            df[f'{n_attrs[i]}-mem'] = array[:, i * multi * 2]
-            df[f'{n_attrs[i]}-mem-prev'] = array[:, i * multi * 2 + 1]
-            if with_dure is True:
-                df[f'{n_attrs[i]}-duration'] = array[:, i * multi * 2 + 2]
-                df[f'{n_attrs[i]}-duration-prev'] = array[:, i * multi * 2 + 3]
-            if with_vertex is True:
-                df[f'{n_attrs[i]}-vertex'] = array[:, (i + 1) * multi * 2 - 4]
-                df[f'{n_attrs[i]}-vertexmem'] = array[:, (i + 1) * multi * 2 - 3]
-                df[f'{n_attrs[i]}-vertex-prev'] = array[:, (i + 1) * multi * 2 - 2]
-                df[f'{n_attrs[i]}-vertexmem-prev'] = array[:, (i + 1) * multi * 2 - 1]
-    for i in range(0, len(attrs)):
-        _mems[i] = df[f'{n_attrs[i]}-mem'].values
-        _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
-        if with_dure is True:
-            _durations[i] = df[f'{n_attrs[i]}-duration'].values
-            _durations_prev[i] = df[f'{n_attrs[i]}-duration-prev'].values
-        if with_vertex is True:
-            _vertexes[i] = df[f'{n_attrs[i]}-vertex'].values
-            _vertex_mems[i] = df[f'{n_attrs[i]}-vertexmem'].values
-            _vertexes_prev[i] = df[f'{n_attrs[i]}-vertex-prev'].values
-            _vertex_mems_prev[i] = df[f'{n_attrs[i]}-vertexmem-prev'].values
-    extremes_f32 = [np.float32(x) for x in extremes]
-    _mark_extreme_memory(_attrs, _vertex_attrs,
-                         _mems, _durations, _vertexes, _vertex_mems,
-                         _mems_prev, _durations_prev, _vertexes_prev, _vertex_mems_prev,
-                         timeperoid, extremes_f32, to_calc_length)
-    return df
+        for i in range(num):
+            _mems[i][:] = 0.0
+            _mems_p[i][:] = 0.0
+            if with_dure:
+                _durations[i][:] = 0.0
+                _durations_p[i][:] = 0.0
+            if with_vertex:
+                _vertexes[i][:] = 0.0
+                _v_mems[i][:] = 0.0
+                _vertexes_p[i][:] = 0.0
+                _v_mems_p[i][:] = 0.0
+    # 5. 参数准备
+    extremes_f32 = np.array(extremes, dtype=np.float32)
+
+    # 6. 调用 Numba/C++ 内核 (原地修改视图内存)
+    _mark_extreme_memory(
+        _attrs, _v_attrs,
+        _mems, _durations, _vertexes, _v_mems,
+        _mems_p, _durations_p, _vertexes_p, _v_mems_p,
+        timeperiod, extremes_f32, to_calc_length
+    )
 
 
 def mark_neutral_memory(df: DataFrame, wsconfig: dict, to_calc_length: int,
-                        attrs: list[str], n_attrs: list[str], timeperoid: int, params: list[np.float64]) -> DataFrame:
+                        attrs: list[str], n_attrs: list[str], timeperiod: int, params: list[np.float64]):
     num = len(attrs)
     if num == 0:
-        return df
-    _attrs = [None] * num
-    _mems = [None] * num
-    _durations = [None] * num
-    _mems_prev = [None] * num
-    _durations_prev = [None] * num
-    for i in range(0, len(attrs)):
-        _attrs[i] = df[attrs[i]].values.astype('float32')
-    n = len(df)
-    if to_calc_length >= n:
-        array = np.full((n, len(attrs) * 4), 0.0, dtype='float32')
-        for i in range(0, len(n_attrs)):
-            df[f'{n_attrs[i]}-mem'] = array[:, i * 4]
-            df[f'{n_attrs[i]}-duration'] = array[:, i * 4 + 1]
-            df[f'{n_attrs[i]}-mem-prev'] = array[:, i * 4]
-            df[f'{n_attrs[i]}-duration-prev'] = array[:, i * 4 + 1]
-    for i in range(0, len(attrs)):
-        _mems[i] = df[f'{n_attrs[i]}-mem'].values
-        _durations[i] = df[f'{n_attrs[i]}-duration'].values
-        _mems_prev[i] = df[f'{n_attrs[i]}-mem-prev'].values
-        _durations_prev[i] = df[f'{n_attrs[i]}-duration-prev'].values
-    params_f32 = [np.float32(x) for x in params]
-    _mark_neutral_memory(_attrs, _mems, _durations, _mems_prev, _durations_prev, timeperoid, params_f32, to_calc_length)
-    return df
+        return
 
+    n = len(df)
+    # 1. 预先准备好所有列，确保内存占坑（指针同步的前提）
+    # 注意：mem 和 mem-prev 必须拥有独立的内存空间
+    suffix_list = ['-mem', '-duration', '-mem-prev', '-duration-prev']
+    for n_attr in n_attrs:
+        for suffix in suffix_list:
+            col = n_attr + suffix
+            if col not in df.columns:
+                df[col] = np.float32(0.0)  # 明确使用 float32 占坑
+
+    # 2. 准备视图列表（List of Views）
+    # 这样传给 Numba 的是直接指向 df 内部的指针
+    _attrs_views = [df[a].values.astype('float32') if df[a].dtype != 'float32' else df[a].values for a in attrs]
+
+    _mems = [df[f'{na}-mem'].values for na in n_attrs]
+    _durs = [df[f'{na}-duration'].values for na in n_attrs]
+    _mems_p = [df[f'{na}-mem-prev'].values for na in n_attrs]
+    _durs_p = [df[f'{na}-duration-prev'].values for na in n_attrs]
+
+    # 3. 处理全量计算时的重置逻辑（使用 [:] 原地重置）
+    if to_calc_length >= n:
+        for i in range(num):
+            _mems[i][:] = 0.0
+            _durs[i][:] = 0.0
+            _mems_p[i][:] = 0.0
+            _durs_p[i][:] = 0.0
+
+    # 4. 参数转换
+    params_f32 = np.array(params, dtype='float32')
+
+    # 5. 调用核心计算（原地修改视图）
+    # 确保你的底层 _mark_neutral_memory 接受的是这些 list of arrays
+    _mark_neutral_memory(
+        _attrs_views, _mems, _durs, _mems_p, _durs_p,
+        timeperiod, params_f32, to_calc_length
+    )
 
 @nb.njit
 def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], durations_prev: [], timeperoid: int, params: list[np.float32],
@@ -2467,29 +2557,53 @@ def _mark_neutral_memory(attrs: [], mems: [], durations: [], mems_prev: [], dura
                     mem_prev[i] = 0
 
 
-def mark_extreme_integral(df: DataFrame, wsconfig: dict, to_calc_length: int,
-                          attrs: list[str], n_attrs: list[str], sma_length: int, params: list[np.float64]) -> DataFrame:
+def mark_extreme_integral(df: pd.DataFrame, wsconfig: dict, to_calc_length: int,
+                          attrs: list[str], n_attrs: list[str], sma_length: int, params: list[np.float64]):
     num = len(attrs)
     if num == 0:
-        return df
-    _means = [None] * num
-    _attrs = [None] * num
-    _integs = [None] * num
-    _amounts = [None] * num
-    for i in range(0, len(attrs)):
-        _attrs[i] = df[attrs[i]].values
+        return
     n = len(df)
+
+    # 1. 独立初始化列，确保内存物理隔离
+    for na in n_attrs:
+        for suffix in ['-integral', '-amount']:
+            col = na + suffix
+            if col not in df.columns:
+                df[col] = np.float32(0.0)
+
+    # 2. 准备视图列表
+    # 强制统一为 float32 以匹配底层内核，避免 Numba 内部转换开销
+    def get_f32_view(name):
+        if df[name].dtype != np.float32:
+            df[name] = df[name].astype(np.float32)
+        return df[name].values
+
+    _attrs = [get_f32_view(a) for a in attrs]
+    _integs = [get_f32_view(f'{na}-integral') for na in n_attrs]
+    _amounts = [get_f32_view(f'{na}-amount') for na in n_attrs]
+
+    # 3. 优化 SMA 计算：使用底层工具减少对象创建
+    # 注意：ta.SMA 返回的是 float64，我们将其转为 float32 视图
+    _means = []
+    for a in attrs:
+        # 这里的 SMA 依然是全量计算，如果性能遇到瓶颈，建议改写为 Numba 版本的增量 SMA
+        s_mean = ta.SMA(df[a].values.astype('float64'), timeperiod=sma_length)
+        _means.append(s_mean.astype('float32'))
+
+    # 4. 全量计算时的内存清理 [:]
     if to_calc_length >= n:
-        array = np.full((n, len(attrs) * 2), 0.0, dtype='float32')
-        for i in range(0, len(n_attrs)):
-            df[f'{n_attrs[i]}-integral'] = array[:, i * 2]
-            df[f'{n_attrs[i]}-amount'] = array[:, i * 2 + 1]
-    for i in range(0, len(attrs)):
-        _means[i] = ta.SMA(df[f'{attrs[i]}'], timeperiod=sma_length)
-        _integs[i] = df[f'{n_attrs[i]}-integral'].values
-        _amounts[i] = df[f'{n_attrs[i]}-amount'].values
-    _mark_extreme_integral(_attrs, _means, _integs, _amounts, sma_length, params, to_calc_length)
-    return df
+        for i in range(num):
+            _integs[i][:] = 0.0
+            _amounts[i][:] = 0.0
+
+    # 5. 参数对齐
+    params_f32 = np.array(params, dtype='float32')
+
+    # 6. 调用内核（原地修改 _integs 和 _amounts）
+    _mark_extreme_integral(
+        _attrs, _means, _integs, _amounts,
+        sma_length, params_f32, to_calc_length
+    )
 
 
 @nb.njit
@@ -2584,17 +2698,27 @@ def _calculate_ratr(_attr, _n_attr, timeperiod, to_calc_length):
 
 # 根据每时间周期平均close变化计算的等效ATR
 def calculate_ratr(df: DataFrame, wsconfig: dict, to_calc_length: int,
-                   attr: str, n_attr: str, timeperiod: int) -> DataFrame:
+                   attr: str, n_attr: str, timeperiod: int):
     n = len(df)
-    if to_calc_length >= n:
-        df[f'{n_attr}'] = np.zeros(n)
+    col_name = f'{n_attr}'
+
+    # 1. 防御性初始化：确保列已存在并统一类型（float32 通常更适合量化特征库）
+    if col_name not in df.columns:
+        df[col_name] = np.zeros(n)
+
+    # 3. 获取物理内存视图 (View)
     _attr = df[attr].values
-    _n_attr = df[f'{n_attr}'].values
+    _n_attr = df[col_name].values
+
+    # 4. 全量计算时的重置逻辑（使用 [:] 原地抹除内容，不改变内存地址）
+    if to_calc_length >= n:
+        _n_attr[:] = 0.0
+
+    # 5. 调用内核（原地修改 _n_attr）
     _calculate_ratr(_attr, _n_attr, timeperiod, to_calc_length)
-    return df
 
 
-def calculate_hurst(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperoid: int) -> pd.Series:
+def calculate_hurst_old(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperoid: int) -> pd.Series:
     """
         主要滚动计算函数，将数据准备好后，交由 Numba 优化函数处理。
     """
@@ -2633,24 +2757,88 @@ def calculate_hurst(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: st
     return final_result
 
 
-@nb.jit(nopython=True)
-def _calculate_rs_values_for_window(log_returns_segment):
-    """
-    原始 R/S 核心计算逻辑，现在只处理单个窗口。
-    """
-    n_values = []
-    rs_values = []
+def calculate_hurst(df: DataFrame, wsconfig: dict, to_calc_length: int, attr: str, timeperoid: int, timeframe_size: int=1, target_attr: str = 'hurst') -> np.ndarray:
+    ver = f"0004_timeperoid_{timeperoid}_timeframesize_{timeframe_size}"
 
-    # 简化：使用 50 个子段，减少计算量，同时保持准确性
-    max_k = len(log_returns_segment) // 2
-    # 设定最小 segment size，如 20
+    # 1. 无论如何，先在 df 内部“占坑”
+    # 这一步保证了 target_attr 在 df 内部拥有一个稳定的物理地址
+    if target_attr not in df.columns:
+        df[target_attr] = np.full(len(df), np.nan, dtype=np.float64)
+
+    # 获取稳定的内存视图
+    target_view = df[target_attr].values
+
+    load = _auto_load(wsconfig, "calculate_hurst", attr, ver)
+    if load is not None:
+        # 【关键】：使用 [:] 原位灌入，不改变 target_attr 的引用地址
+        fill_len = min(len(load), len(target_view))
+        target_view[-fill_len:] = load[-fill_len:]
+        return target_view
+
+    s = df[attr].values
+
+    # 实际传入 Numba 内部参与 R/S 拟合的点数
+    actual_window_size = int(timeperoid / timeframe_size)
+    # 确保采样长度是步长的整数倍，避免切片越界
+    effective_raw_window = actual_window_size * timeframe_size
+    h_res = calc_hurst(s, actual_window_size, timeframe_size)
+
+    # 4. 【关键】：直接原地修改 target_view
+    # 这样就不需要再在外部执行 df['hurst'] = ...
+    target_view[:] = np.nan  # 先清空旧值
+    start_loc = (timeperoid - effective_raw_window)
+    # 长度保护：确保写入不越界
+    write_len = min(len(h_res), len(target_view) - start_loc)
+    target_view[start_loc: start_loc + write_len] = h_res[:write_len]
+
+    # 6. 保存
+    _auto_save(wsconfig, target_view, "calculate_hurst", attr, ver)
+    return target_view
+
+def calc_hurst(close, window, stride):
+    log_returns_full = np.concatenate([
+        np.array([0.0], dtype=np.float64),
+        np.diff(np.log(close))
+    ])
+    h_res = _calculate_rolling_dfa_hurst_numba(log_returns_full, window_size=window, stride=stride)
+    head_nan_len = len(close) - len(h_res)
+    h_res = np.concatenate([
+        np.full(head_nan_len, np.nan, dtype=np.float64),
+        h_res
+    ])
+    mask = ~np.isnan(h_res)
+    if np.any(mask):
+        first_valid_idx = np.argmax(mask)
+        print(f'calc_hurst: len={len(close)}, window={window}, first_non_nan_at={first_valid_idx}')
+    else:
+        print(f'calc_hurst: len={len(close)}, window={window}, ALL values are NaN!')
+    # ------------------
+    return h_res
+
+@njit  # 强烈建议配合 Numba
+def _calculate_rs_values_for_window(log_returns_segment):
+    n = len(log_returns_segment)
+    max_k = n // 2
     segment_min = 20
 
-    # 循环选择的子段长度 k
-    for k in range(segment_min, max_k + 1):
-        num_segments = len(log_returns_segment) // k
+    # 1. 预先计算最大可能的循环次数
+    # k 从 segment_min 变到 max_k，最大可能产生的个数是：
+    max_possible_size = max(0, max_k - segment_min + 1)
 
-        # 确保有足够的段数，例如至少 3 段
+    # 如果长度不足以计算，直接返回空数组
+    if max_possible_size == 0:
+        return np.empty(0), np.empty(0)
+
+    # 2. 预分配内存区
+    # 使用 np.empty 会比 np.zeros 快一点，因为不初始化内存
+    n_values_pool = np.empty(max_possible_size, dtype=np.float64)
+    rs_values_pool = np.empty(max_possible_size, dtype=np.float64)
+
+    # 记录实际写入了多少个点
+    write_idx = 0
+
+    for k in range(segment_min, max_k + 1):
+        num_segments = n // k
         if num_segments < 3:
             continue
 
@@ -2662,42 +2850,49 @@ def _calculate_rs_values_for_window(log_returns_segment):
             end_idx = start_idx + k
             segment = log_returns_segment[start_idx:end_idx]
 
+            # 内部计算逻辑（手动展开 mean/std 性能会更好，Numba 优化得很好）
             mean_segment = np.mean(segment)
+            # 这里的 cumsum 如果在 Numba 下会自动优化，不需要额外 append
             cumulative_deviation = np.cumsum(segment - mean_segment)
 
             R = np.max(cumulative_deviation) - np.min(cumulative_deviation)
             S = np.std(segment)
 
-            if S > 1e-9:  # 使用一个小值而不是 0
+            if S > 1e-9:
                 rs_per_segment_sum += R / S
                 rs_per_segment_count += 1
 
         if rs_per_segment_count > 0:
             avg_rs = rs_per_segment_sum / rs_per_segment_count
-            n_values.append(k)
-            rs_values.append(avg_rs)
+            # 3. 直接写入预分配的内存区
+            n_values_pool[write_idx] = float(k)
+            rs_values_pool[write_idx] = avg_rs
+            write_idx += 1
 
-    # 返回 NumPy 数组
-    return np.array(n_values), np.array(rs_values)
+    # 4. 只返回有效的部分
+    return n_values_pool[:write_idx], rs_values_pool[:write_idx]
 
 
-@nb.njit
-def _calculate_rolling_hurst_numba(log_returns_full, window_size):
+@nb.njit(parallel=True)
+def _calculate_rolling_hurst_numba(log_returns_full, window_size, stride=1):
     """
     在 Numba 内部执行高效的滚动计算和 polyfit。
     """
     full_length = len(log_returns_full)
+
+    if full_length < window_size:
+        return np.empty(0)
+
     # 结果数组的长度
     result_length = full_length - window_size
     hurst_rs = np.zeros(result_length)
 
     # Python 外部的 polyfit 必须在这里实现
     # 由于 np.polyfit 不支持 nopython=True，我们需要手动实现线性回归
-
-    for i in range(result_length):
-        if i % 1000 == 0:
-            print(f'hurst: {i}/{result_length}')
-        segment = log_returns_full[i:i + window_size]
+    for i in nb.prange(result_length):
+        start = i
+        end = start + window_size
+        segment = log_returns_full[start:end:stride]
 
         # 调用核心 R/S 计算
         n_values, rs_values = _calculate_rs_values_for_window(segment)
@@ -2733,6 +2928,99 @@ def _calculate_rolling_hurst_numba(log_returns_full, window_size):
 
     return hurst_rs
 
+@nb.njit(parallel=True)
+def _calculate_rolling_dfa_hurst_numba(log_returns_full, window_size, stride=1):
+    full_length = len(log_returns_full)
+    if full_length < window_size:
+        return np.empty(0)
+
+    # 结果数组的长度：依然对应 dfdst 的每一行
+    result_length = full_length - window_size
+    alpha_res = np.zeros(result_length)
+
+    # 采样后的有效窗口长度
+    effective_n = window_size // stride
+
+    max_s = effective_n // 4
+    min_s = 10
+
+    temp_scales = []
+    curr_s = float(min_s)
+    # 使用 1.5 倍增长，可以在 [10, 36] 之间拿到 10, 15, 22, 33 约4个点
+    # 如果窗口大，点会更多
+    while curr_s <= max_s:
+        temp_scales.append(int(curr_s))
+        curr_s *= 1.5
+
+    active_scales = np.array(temp_scales)
+    num_active = len(active_scales)
+
+    # 保护：如果回归点数太少（少于3个），DFA 失去意义
+    if num_active < 3:
+        return np.full(result_length, np.nan)
+    for i in nb.prange(result_length):
+        start = i
+        end = start + window_size
+
+        # --- 关键修改：按 stride 采样 ---
+        # 这里的 segment 长度约为 window_size // stride
+        segment = log_returns_full[start:end:stride]
+
+        # 1. 集成序列 (在采样后的维度上进行)
+        walk = np.cumsum(segment - np.mean(segment))
+        current_n = len(walk)
+
+        f_n = np.zeros(len(active_scales))
+
+        for s_idx in range(len(active_scales)):
+            n = active_scales[s_idx]
+            num_segments = current_n // n
+            if num_segments < 2: continue
+
+            rms_sum_sq = 0.0
+            for j in range(num_segments):
+                w_sub = walk[j * n: (j + 1) * n]
+
+                # 2. 线性去趋势
+                x = np.arange(float(n))
+                y = w_sub
+
+                sum_x = (n * (n - 1)) / 2.0
+                sum_xx = (n * (n - 1) * (2 * n - 1)) / 6.0
+                sum_y = np.sum(y)
+                sum_xy = np.sum(x * y)
+
+                denom = n * sum_xx - sum_x ** 2
+                if abs(denom) > 1e-12:
+                    slope = (n * sum_xy - sum_x * sum_y) / denom
+                    intercept = (sum_y - slope * sum_x) / n
+
+                    # 3. 计算残差
+                    res_sq_sum = 0.0
+                    for k_idx in range(n):
+                        res_sq_sum += (y[k_idx] - (slope * x[k_idx] + intercept)) ** 2
+                    rms_sum_sq += res_sq_sum / n
+
+            f_n[s_idx] = np.sqrt(rms_sum_sq / num_segments)
+
+        # 4. 线性回归求 alpha
+        valid_mask = f_n > 1e-12
+        if np.sum(valid_mask) >= 3:
+            log_scales = np.log(active_scales[valid_mask].astype(np.float64))
+            log_fn = np.log(f_n[valid_mask])
+
+            # 手动线性回归
+            n_reg = len(log_scales)
+            sx, sy, sxy, sxx = np.sum(log_scales), np.sum(log_fn), np.sum(log_scales * log_fn), np.sum(log_scales ** 2)
+            d = n_reg * sxx - sx ** 2
+            if abs(d) > 1e-12:
+                alpha_res[i] = (n_reg * sxy - sx * sy) / d
+            else:
+                alpha_res[i] = np.nan
+        else:
+            alpha_res[i] = np.nan
+
+    return alpha_res
 
 @nb.njit
 def _mark_next_ups(values: np.ndarray, gaps: np.ndarray, rs: np.ndarray, timemax: int):
@@ -2820,3 +3108,158 @@ def calculate_circle_length_ema(df: DataFrame, wsconfig: dict, to_calc_length: i
         df[ema_attr] = np.full(n, 0, dtype=np.float64)
     _calculate_circle_length_ema(df[side_attr].values, df[ema_attr].values, init_avg, alpha=alpha)
     return df
+
+@njit
+def calc_symbolic_entropy(close: np.ndarray, to_calc_length: int, timeperoid=720, pattern_len=3, combine_period=1):
+    """
+    close: 1m 收盘价序列
+    lookback: 统计分布的窗口大小 (以1m为单位，如720代表最近12小时)
+    pattern_len: 模式长度 L (如3, 4, 5)
+    combine_period: 合并周期 C (如1代表1m, 5代表5m)
+    """
+    n = len(close)
+    entropy_vec = np.zeros(n)
+
+    # 模式数量 2^L
+    num_patterns = 1 << pattern_len
+    # 计数器
+    counts = np.zeros(num_patterns, dtype=np.int32)
+
+    # 1. 预计算符号 (当前值相对于 C 周期前的值)
+    symbols = np.zeros(n, dtype=np.int32)
+    for i in range(combine_period, n):
+        if close[i] >= close[i - combine_period]:
+            symbols[i] = 1
+        else:
+            symbols[i] = 0
+
+    # 2. 预计算每个位置作为结尾的模式索引 (Pattern Index)
+    # 例如 C=5, L=3, 则模式由 symbols[i], symbols[i-5], symbols[i-10] 组成
+    pattern_indices = np.zeros(n, dtype=np.int32)
+    offset = (pattern_len - 1) * combine_period
+    for i in range(offset, n):
+        idx = 0
+        for k in range(pattern_len):
+            # 位运算合成索引
+            bit = symbols[i - k * combine_period]
+            idx = (idx << 1) | bit
+        pattern_indices[i] = idx
+
+    # 3. 滑动窗口统计 (O(1) 递增更新)
+    # 有效起始点：需满足模式长度和统计窗口
+    start_idx = timeperoid + offset
+    if n <= start_idx:
+        return entropy_vec
+
+    # 初始窗口填充
+    for j in range(start_idx - timeperoid + 1, start_idx + 1):
+        counts[pattern_indices[j]] += 1
+
+    for i in range(start_idx, n):
+        if i > start_idx:
+            # 移入新模式，移出旧模式
+            new_p = pattern_indices[i]
+            old_p = pattern_indices[i - timeperoid]
+            counts[new_p] += 1
+            counts[old_p] -= 1
+
+        # 计算香农熵
+        e = 0.0
+        total = timeperoid
+        for c in counts:
+            if c > 0:
+                p = c / total
+                e -= p * np.log2(p)
+        entropy_vec[i] = e
+
+    return entropy_vec
+
+
+@njit
+def calc_fractal_er(close, to_calc_length: int, timeperoid=720, combine_period=1):
+    """
+    lookback: 统计窗口 (以1m为单位)
+    combine_period: 合并周期 C (如5代表观察5m级别的路径效率)
+    """
+    n = len(close)
+    er_vec = np.zeros(n)
+
+    # 路径总和 (Rolling Sum)
+    path_length = 0.0
+
+    # 预计算每一步的“步长” (基于 C 周期)
+    # 注意：为了量纲一致，我们依然在 1m 步长上滑动，但比较的是 C 周期的变动
+    steps = np.zeros(n)
+    for i in range(combine_period, n):
+        steps[i] = abs(close[i] - close[i - combine_period])
+
+    for i in range(combine_period, n):
+        path_length += steps[i]
+        if i >= timeperoid:
+            path_length -= steps[i - timeperoid]
+
+            if i >= timeperoid:
+                # 净位移
+                disp = close[i] - close[i - timeperoid]
+                if path_length > 0:
+                    er_vec[i] = disp / path_length
+                else:
+                    er_vec[i] = 0.0
+
+    return er_vec
+
+
+def calculate_symbolic_entropy(df: DataFrame, wsconfig: dict, to_calc_length: int, timeperoid: int, combine_period=1, pattern_len=3):
+    return np.log(3.001 - calc_symbolic_entropy(df['close'].values, to_calc_length, timeperoid, pattern_len, combine_period))
+
+
+def calulate_freactal_er(df: DataFrame, wsconfig: dict, to_calc_length: int, timeperoid: int, combine_period=1):
+    return np.arctanh(calc_fractal_er(df['close'].values, to_calc_length, timeperoid, combine_period) * 0.9999)
+
+
+@nb.jit(nopython=True)
+def _calculate_bjs(close: np.ndarray, step: np.ndarray,
+                   tm_length: np.ndarray, bjsshort: np.ndarray, bjslong: np.ndarray,
+                   min_ratio: float, max_ratio: float, to_calc_length: int):
+    n = len(close)
+    # print(close)
+    max_len = int(np.rint(tm_length[-1] * max_ratio))
+    start = max(n - to_calc_length, max_len)
+    # _sqrts = np.zeros(max_len - min_len, dtype=np.float64)
+    # for j in range(min_len, max_len):
+    #    _sqrts[j - min_len] = np.sqrt(j / min_len)
+    for i in range(start, n):
+        if np.isnan(step[i]) or step[i] == 0:
+            continue
+        min_len = int(np.rint(tm_length[i] * min_ratio))
+        max_len = int(np.rint(tm_length[i] * max_ratio))
+        bjsshort[i] = (close[i] - close[i - min_len]) / step[i]
+        bjslong[i] = 0
+        for j in range(min_len, max_len):
+            d = close[i] - close[i - j]
+            # if np.abs(d) < step[i]:
+            #    continue
+            r = d / step[i] / (np.sqrt(j / (min_len + 1e-9)) + 1e-9)  # _sqrts[j - min_len]
+            if np.abs(r) > np.abs(bjslong[i]):
+                bjslong[i] = r
+
+
+def calculate_bjs(df: DataFrame, wsconfig: dict, to_calc_length: int, prefix: str, val: int, min_ratio: float, max_ratio: float):
+    n = len(df)
+    close = df['close'].values
+    step = df[f'diff{prefix}-{val}-mean-long'].values
+    tm_length = df[f'tm-mean-{prefix}'].values
+    if to_calc_length >= n:
+        bjsshort = np.zeros(n)
+        bjslong = np.zeros(n)
+    else:
+        bjsshort = df[f'bjsshort{prefix}-{val}'].values
+        # bjslong = df[f'bjslong_o{prefix}-{val}'].values
+        bjslong = df[f'bjslong{prefix}-{val}'].values
+    _calculate_bjs(close, step, tm_length, bjsshort, bjslong, min_ratio, max_ratio, to_calc_length)
+    df[f'bjsshort{prefix}-{val}'] = bjsshort
+    df[f'bjslong{prefix}-{val}'] = bjslong
+    # df[f'bjslong{prefix}-{val}'] = ta.EMA(df[f'bjslong_o{prefix}-{val}'], timeperiod=7)
+
+def talib_ema(data, period):
+    return _ema_kernel(data, period)
